@@ -363,6 +363,11 @@ def test_abort_loading_requests(request_runner, async_scheduling: bool):
 
 
 def test_take_events_populates_token_ids():
+    """
+    It emits one stored event for two known blocks, then verifies that the
+    resulting BlockStored event contains the concatenated token_ids from both
+    stored block mappings.
+    """
     (
         scheduler,
         manager,
@@ -393,6 +398,11 @@ def test_take_events_populates_token_ids():
 
 
 def test_take_events_resolves_parent_block_hash_for_non_first_block():
+    """
+    It emits a stored event for the second block only, then verifies that
+    the emitted BlockStored event keeps only that block's token_ids and
+    resolves parent_block_hash to the first block.
+    """
     (
         scheduler,
         manager,
@@ -422,6 +432,11 @@ def test_take_events_resolves_parent_block_hash_for_non_first_block():
 
 
 def test_take_events_cleans_mapping_after_consumption():
+    """
+    It emits a stored event for the first block only, then verifies that
+    the first block was removed from scheduler._stored_block_tokens and the
+    second block mapping stayed intact.
+    """
     (
         scheduler,
         manager,
@@ -450,6 +465,11 @@ def test_take_events_cleans_mapping_after_consumption():
 
 
 def test_block_removed_events_clean_up_token_mapping():
+    """
+    It emits a removed event for the first block only, then verifies that
+    the scheduler returns BlockRemoved and deletes only that block's token
+    mapping while keeping the second mapping intact.
+    """
     (
         scheduler,
         manager,
