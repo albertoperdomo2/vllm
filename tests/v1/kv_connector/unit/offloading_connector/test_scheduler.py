@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -9,10 +11,52 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
     to_keys,
 )
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    OffloadingConnectorScheduler,
+)
 from vllm.distributed.kv_events import BlockRemoved, BlockStored
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import OffloadingEvent
 from vllm.v1.request import RequestStatus
+
+
+def _create_scheduler_with_stored_block_tokens():
+    manager = MagicMock()
+    spec = SimpleNamespace(
+        gpu_block_size=[4],
+        block_size_factor=3,
+        get_manager=lambda: manager,
+        vllm_config=SimpleNamespace(
+            cache_config=SimpleNamespace(enable_prefix_caching=False)
+        ),
+    )
+    scheduler = OffloadingConnectorScheduler(spec)
+
+    first_hash = BlockHash(b"block-1")
+    second_hash = BlockHash(b"block-2")
+    first_token_ids = list(range(12))
+    second_token_ids = list(range(12, 24))
+
+    scheduler._stored_block_tokens = {
+        first_hash: (first_token_ids, None),
+        second_hash: (second_token_ids, first_hash),
+    }
+
+    return (
+        scheduler,
+        manager,
+        first_hash,
+        second_hash,
+        first_token_ids,
+        second_token_ids,
+    )
+
+
+def _take_events(*events: OffloadingEvent):
+    def take_events() -> Iterable[OffloadingEvent]:
+        yield from events
+
+    return take_events
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -316,3 +360,123 @@ def test_abort_loading_requests(request_runner, async_scheduling: bool):
 
     # assert request is deleted
     assert req_id not in runner.scheduler.requests
+
+
+def test_take_events_populates_token_ids():
+    (
+        scheduler,
+        manager,
+        first_hash,
+        second_hash,
+        first_token_ids,
+        second_token_ids,
+    ) = _create_scheduler_with_stored_block_tokens()
+
+    manager.take_events.side_effect = _take_events(
+        OffloadingEvent(
+            block_hashes=[first_hash, second_hash],
+            block_size=scheduler.offloaded_block_size,
+            medium="CPU",
+            removed=False,
+        )
+    )
+
+    events = list(scheduler.take_events())
+    assert len(events) == 1
+
+    event = events[0]
+    assert isinstance(event, BlockStored)
+    assert event.block_hashes == [first_hash, second_hash]
+    assert event.token_ids == first_token_ids + second_token_ids
+    assert event.block_size == scheduler.offloaded_block_size
+    assert event.medium == "CPU"
+
+
+def test_take_events_resolves_parent_block_hash_for_non_first_block():
+    (
+        scheduler,
+        manager,
+        first_hash,
+        second_hash,
+        _first_token_ids,
+        second_token_ids,
+    ) = _create_scheduler_with_stored_block_tokens()
+
+    manager.take_events.side_effect = _take_events(
+        OffloadingEvent(
+            block_hashes=[second_hash],
+            block_size=scheduler.offloaded_block_size,
+            medium="CPU",
+            removed=False,
+        )
+    )
+
+    events = list(scheduler.take_events())
+    assert len(events) == 1
+
+    event = events[0]
+    assert isinstance(event, BlockStored)
+    assert event.block_hashes == [second_hash]
+    assert event.token_ids == second_token_ids
+    assert event.parent_block_hash == first_hash
+
+
+def test_take_events_cleans_mapping_after_consumption():
+    (
+        scheduler,
+        manager,
+        first_hash,
+        second_hash,
+        _first_token_ids,
+        second_token_ids,
+    ) = _create_scheduler_with_stored_block_tokens()
+
+    manager.take_events.side_effect = _take_events(
+        OffloadingEvent(
+            block_hashes=[first_hash],
+            block_size=scheduler.offloaded_block_size,
+            medium="CPU",
+            removed=False,
+        )
+    )
+
+    events = list(scheduler.take_events())
+    assert len(events) == 1
+
+    assert first_hash not in scheduler._stored_block_tokens
+    assert scheduler._stored_block_tokens == {
+        second_hash: (second_token_ids, first_hash)
+    }
+
+
+def test_block_removed_events_clean_up_token_mapping():
+    (
+        scheduler,
+        manager,
+        first_hash,
+        second_hash,
+        _first_token_ids,
+        second_token_ids,
+    ) = _create_scheduler_with_stored_block_tokens()
+
+    manager.take_events.side_effect = _take_events(
+        OffloadingEvent(
+            block_hashes=[first_hash],
+            block_size=scheduler.offloaded_block_size,
+            medium="CPU",
+            removed=True,
+        )
+    )
+
+    events = list(scheduler.take_events())
+    assert len(events) == 1
+
+    event = events[0]
+    assert isinstance(event, BlockRemoved)
+    assert event.block_hashes == [first_hash]
+    assert event.medium == "CPU"
+
+    assert first_hash not in scheduler._stored_block_tokens
+    assert scheduler._stored_block_tokens == {
+        second_hash: (second_token_ids, first_hash)
+    }
