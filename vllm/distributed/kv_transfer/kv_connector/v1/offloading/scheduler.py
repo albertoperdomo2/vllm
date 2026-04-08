@@ -131,9 +131,7 @@ class OffloadingConnectorScheduler:
 
         # token data for enriching offloading events
         # offload_key → (token_ids, parent_block_hash)
-        self._stored_block_tokens: dict[
-            OffloadKey, tuple[list[int], bytes | None]
-        ] = {}
+        self._stored_block_tokens: dict[OffloadKey, tuple[list[int], bytes | None]] = {}
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
@@ -345,24 +343,14 @@ class OffloadingConnectorScheduler:
             for idx, key in enumerate(new_offload_keys):
                 if key in keys_to_store:
                     offloaded_idx = start_block_idx + idx
-                    token_start = (
-                        offloaded_idx * group_config.offloaded_block_size
-                    )
-                    token_end = (
-                        token_start + group_config.offloaded_block_size
-                    )
-                    token_ids = list(
-                        req.all_token_ids[token_start:token_end]
-                    )
+                    token_start = offloaded_idx * group_config.offloaded_block_size
+                    token_end = token_start + group_config.offloaded_block_size
+                    token_ids = list(req.all_token_ids[token_start:token_end])
 
                     parent_block_hash = None
                     if offloaded_idx > 0:
-                        parent_key = group_state.offload_keys[
-                            offloaded_idx - 1
-                        ]
-                        parent_block_hash = get_offload_block_hash(
-                            parent_key
-                        )
+                        parent_key = group_state.offload_keys[offloaded_idx - 1]
+                        parent_block_hash = get_offload_block_hash(parent_key)
 
                     self._stored_block_tokens[key] = (
                         token_ids,
@@ -449,13 +437,9 @@ class OffloadingConnectorScheduler:
             A list of KV cache events.
         """
         for event in self.manager.take_events():
-            block_hashes = [
-                get_offload_block_hash(key) for key in event.keys
-            ]
+            block_hashes = [get_offload_block_hash(key) for key in event.keys]
             if event.removed:
-                yield BlockRemoved(
-                    block_hashes=block_hashes, medium=event.medium
-                )
+                yield BlockRemoved(block_hashes=block_hashes, medium=event.medium)
                 # Clean token mapping for removed blocks
                 for key in event.keys:
                     self._stored_block_tokens.pop(key, None)
