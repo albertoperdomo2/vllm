@@ -370,11 +370,17 @@ class NgramProposerGPU:
         )
 
         # Compute validity masks.
+        remaining = (self.max_model_len - num_tokens_tmp).clamp(min=0, max=self.k)
         sampled_flags = valid_sampled_tokens_count > 0
         valid_mask = torch.ones(batch_size, dtype=torch.bool, device=self.device)
 
         with set_forward_context(None, self.vllm_config):
-            combined_mask = sampled_flags & valid_mask & (num_tokens_tmp >= self.min_n)
+            combined_mask = (
+                sampled_flags
+                & valid_mask
+                & (num_tokens_tmp >= self.min_n)
+                & (remaining > 0)
+            )
 
             with record_function_or_nullcontext("ngram_proposer_gpu: kernel"):
                 draft_tokens, num_valid_draft_tokens = self.kernel(
@@ -382,6 +388,18 @@ class NgramProposerGPU:
                     token_ids_gpu,
                     combined_mask,
                 )
+
+            num_valid_draft_tokens = torch.minimum(
+                num_valid_draft_tokens, remaining.to(torch.int32)
+            )
+
+            positions = torch.arange(self.k, device=self.device).unsqueeze(0)  # [1, k]
+            budget_mask = positions < remaining.unsqueeze(1)  # [batch, k]
+            draft_tokens = torch.where(
+                budget_mask,
+                draft_tokens,
+                torch.full_like(draft_tokens, -1),
+            )
 
             return draft_tokens, num_valid_draft_tokens
 
