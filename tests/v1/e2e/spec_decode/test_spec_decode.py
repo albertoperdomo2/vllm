@@ -224,6 +224,41 @@ def test_ngram_gpu_default_with_async_scheduling(
     cleanup_dist_env_and_memory()
 
 
+@pytest.mark.parametrize("method", ["ngram_gpu", "ngram"])
+@single_gpu_only
+def test_ngram_max_model_len_boundary(method: str):
+    """Regression test for #42533: ngram_gpu must not propose
+    draft tokens past max_model_len budget."""
+    spec_config = {
+        "method": method,
+        "num_speculative_tokens": 1,
+        "prompt_lookup_min": 2,
+        "prompt_lookup_max": 5,
+    }
+    llm = LLM(
+        model="facebook/opt-125m",
+        max_model_len=17,
+        enforce_eager=True,
+        gpu_memory_utilization=0.5,
+        speculative_config=spec_config,
+        seed=1234,
+    )
+    prompt = "def f(x):\n    return x + 1\n\n"
+    params = SamplingParams(
+        temperature=0.0,
+        max_tokens=64,
+        ignore_eos=True,
+        seed=1234,
+    )
+    outputs = llm.generate([prompt], params)
+    assert len(outputs) == 1
+    assert outputs[0].outputs[0].finish_reason == "length"
+    assert len(outputs[0].outputs[0].token_ids) == 2
+    del llm
+    torch.accelerator.empty_cache()
+    cleanup_dist_env_and_memory()
+
+
 @single_gpu_only
 @large_gpu_mark(min_gb=20)
 def test_suffix_decoding_acceptance(
