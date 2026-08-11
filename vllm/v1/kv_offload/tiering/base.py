@@ -39,6 +39,9 @@ class TieringOffloadingMetrics:
 
     LOOKUP_SYNC_DELAY = "vllm:kv_offload_tiering_lookup_sync_delay_seconds"
     LOOKUP_ASYNC_DELAY = "vllm:kv_offload_tiering_lookup_async_delay_seconds"
+    PREFETCH_ATTEMPTED = "vllm:kv_offload_tiering_prefetch_attempted"
+    PREFETCH_PROMOTED = "vllm:kv_offload_tiering_prefetch_promoted"
+    PREFETCH_SKIPPED = "vllm:kv_offload_tiering_prefetch_skipped"
 
 
 @dataclass

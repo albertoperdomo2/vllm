@@ -16,6 +16,8 @@ Configuration via kv_connector_extra_config:
   - cache_policy_module_path: (optional) Python import path to load
     eviction_policy from when it names an out-of-tree CachePolicy not
     registered via CachePolicyFactory
+  - prefetch_chunks: (optional) number of additional chunks to proactively
+    promote on the first secondary-tier miss (default: 0)
   - secondary_tiers: (optional) List of secondary tier configurations
     Each secondary tier config is a dict with:
       - type: (required) Type of secondary tier (e.g., "example", "storage", "network")
@@ -44,6 +46,7 @@ from typing_extensions import override
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
+    OffloadingCounterMetadata,
     OffloadingHistogramMetadata,
     OffloadingManager,
     OffloadingMetricMetadata,
@@ -127,6 +130,31 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 ),
             )
         )
+        metrics[TieringOffloadingMetrics.PREFETCH_ATTEMPTED] = (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of KV cache chunks passed to prefetch() for proactive "
+                    "promotion, labeled by tier. Phase 1 toy read-ahead."
+                ),
+                labelnames=("tier",),
+            )
+        )
+        metrics[TieringOffloadingMetrics.PREFETCH_PROMOTED] = OffloadingCounterMetadata(
+            documentation=(
+                "Number of prefetch chunks that initiated a secondary->primary "
+                "promotion, labeled by tier. Subset of PREFETCH_ATTEMPTED."
+            ),
+            labelnames=("tier",),
+        )
+        metrics[TieringOffloadingMetrics.PREFETCH_SKIPPED] = OffloadingCounterMetadata(
+            documentation=(
+                "Number of prefetch chunks skipped (not in any secondary tier, "
+                "or primary tier full), labeled by tier. Subset of "
+                "PREFETCH_ATTEMPTED."
+            ),
+            labelnames=("tier",),
+        )
+
         secondary_tier_configs = extra_config.get("secondary_tiers", [])
         if not isinstance(secondary_tier_configs, list):
             raise ValueError("secondary_tiers must be a list of tier configurations")
@@ -146,6 +174,14 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         self.secondary_tier_configs = self.extra_config.get("secondary_tiers", [])
         if not isinstance(self.secondary_tier_configs, list):
             raise ValueError("secondary_tiers must be a list of tier configurations")
+
+        # Prefetch chunks
+        prefetch_chunks = self.extra_config.get("prefetch_chunks", 0)
+        if not isinstance(prefetch_chunks, int) or prefetch_chunks < 0:
+            raise ValueError(
+                f"prefetch_chunks must be a non-negative int, got {prefetch_chunks!r}"
+            )
+        self.prefetch_chunks = prefetch_chunks
 
         # Scheduler-side mmap (rank=None); kept for cleanup
         self._scheduler_mmap: SharedOffloadRegion | None = None
@@ -216,6 +252,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             tiering_manager = TieringOffloadingManager(
                 primary_tier=primary_tier,
                 secondary_tiers=secondary_tiers,
+                prefetch_chunks=self.prefetch_chunks,
             )
             if int(self.extra_config.get("store_threshold", 0)) >= 2:
                 raise ValueError(

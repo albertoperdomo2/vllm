@@ -544,7 +544,7 @@ class OffloadingConnectorScheduler:
 
     def _maximal_prefix_lookup(
         self,
-        keys: Iterable[OffloadKey],
+        keys: Sequence[OffloadKey],
         req_context: ReqContext,
         req: Request,
         group_config: GroupOffloadConfig,
@@ -573,6 +573,15 @@ class OffloadingConnectorScheduler:
                     # async lookups (until a miss is detected).
                     defer_lookup = True
                 case LookupResult.MISS:
+                    # phase 1 toy prefetch hook
+                    # for now, we restrict the toy to full-attention groups
+                    # in the future, we might want to plug it in _sliding_window_lookup
+                    n = getattr(self.manager, "prefetch_chunks", 0)
+                    prefetch = getattr(self.manager, "prefetch", None)
+                    if n > 0 and prefetch is not None:
+                        upcoming = keys[local_idx + 1 : local_idx + 1 + n]
+                        if upcoming:
+                            prefetch(upcoming, req_context)
                     break
         return hit_count if not defer_lookup else None
 
