@@ -68,6 +68,28 @@ def to_keys(int_ids: Iterable[int]) -> list[OffloadKey]:
     return [make_offload_key(str(i).encode(), 0) for i in int_ids]
 
 
+def counter_total(stats: OffloadingConnectorStats, name: str) -> float:
+    """Sum a counter across all its tier label values."""
+    return sum(stats.data["data"].get(name, {}).values())
+
+
+def assert_prefetch_accounting(stats: OffloadingConnectorStats, manager) -> None:
+    """Every prefetch promotion is resolved, untracked, or still tracked.
+
+    This must hold unconditionally — including when tracking is disabled —
+    otherwise promotions vanish from the accounting and the useful/wasted
+    ratio silently loses its denominator.
+    """
+    promoted = counter_total(stats, TieringOffloadingMetrics.PREFETCH_PROMOTED)
+    accounted = (
+        counter_total(stats, TieringOffloadingMetrics.PREFETCH_USEFUL)
+        + counter_total(stats, TieringOffloadingMetrics.PREFETCH_WASTED)
+        + counter_total(stats, TieringOffloadingMetrics.PREFETCH_UNTRACKED)
+        + len(manager._prefetched)
+    )
+    assert accounted == promoted
+
+
 def count_hits(manager, keys: list[OffloadKey]) -> int | None:
     """Count consecutive lookup hits from the start of keys.
 
@@ -141,6 +163,25 @@ def test_tiering_spec_collects_secondary_metric_definitions(monkeypatch):
     metadata = metrics[MetricsSecondaryTierManager.MY_TIER_METRIC]
     assert metadata.documentation == "Number of bytes served by the test tier."
     assert metadata.labelnames == ("tier",)
+
+
+def test_tiering_spec_defines_prefetch_outcome_metrics():
+    """The outcome counters must reach Prometheus with a single tier label.
+
+    OffloadPromMetrics builds its counters straight from these definitions, and
+    _get_prometheus_metric asserts the emitted label arity matches labelnames.
+    """
+    metrics = TieringOffloadingSpec.build_metric_definitions({})
+
+    for name in (
+        TieringOffloadingMetrics.PREFETCH_USEFUL,
+        TieringOffloadingMetrics.PREFETCH_WASTED,
+        TieringOffloadingMetrics.PREFETCH_REDUNDANT,
+        TieringOffloadingMetrics.PREFETCH_UNTRACKED,
+    ):
+        metadata = metrics[name]
+        assert isinstance(metadata, OffloadingCounterMetadata)
+        assert metadata.labelnames == ("tier",)
 
 
 def test_tiering_manager_aggregates_secondary_stats():
@@ -402,6 +443,180 @@ class TestTieringOffloadingManager:
 
         # Next lookup should succeed
         assert count_hits(self.manager, blocks) == 3
+
+    def _promote_by_prefetch(self, block: OffloadKey) -> None:
+        """Prefetch one block out of secondary_tier1 and let the job complete."""
+        self.secondary_tier1.blocks[block] = True
+        assert self.manager.prefetch([block], _CTX) == 1
+        # Step 1 flushes the deferred submit_load(), step 2 processes the job.
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+
+    def test_prefetch_useful_when_demand_lookup_hits(self, manager_setup):
+        """A demand lookup reaching a prefetched block counts it as useful."""
+        self._start_request()
+        block = to_keys([1])[0]
+        self._promote_by_prefetch(block)
+
+        assert self.manager.lookup(block, _CTX) is LookupResult.HIT
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_PROMOTED) == 1
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_USEFUL) == 1
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_WASTED) == 0
+        # resolved keys stop being tracked, so they cannot be counted twice
+        assert block not in self.manager._prefetched
+        assert_prefetch_accounting(stats, self.manager)
+
+    def test_prefetch_wasted_when_evicted_before_demand_lookup(self, manager_setup):
+        """A prefetched block evicted before the demand scan counts as wasted."""
+        self._start_request()
+        block = to_keys([1])[0]
+        self._promote_by_prefetch(block)
+
+        # Fill the 5-block primary tier, forcing the promoted block out.
+        filler = to_keys(range(10, 15))
+        result = self.manager.prepare_store(filler, _CTX)
+        assert result is not None
+        assert block in result.evicted_keys
+
+        assert self.manager.lookup(block, _CTX) is LookupResult.MISS
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_USEFUL) == 0
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_WASTED) == 1
+        assert block not in self.manager._prefetched
+        assert_prefetch_accounting(stats, self.manager)
+
+    def test_prefetch_in_flight_promotion_stays_tracked(self, manager_setup):
+        """HIT_PENDING resolves on a later step, so it counts neither way yet."""
+        self._start_request()
+        block = to_keys([1])[0]
+        self.secondary_tier1.blocks[block] = True
+        assert self.manager.prefetch([block], _CTX) == 1
+
+        # The promotion is still in flight: primary holds the slot at ref_cnt=-1.
+        assert self.manager.lookup(block, _CTX) is LookupResult.HIT_PENDING
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_USEFUL) == 0
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_WASTED) == 0
+        assert block in self.manager._prefetched
+        assert_prefetch_accounting(stats, self.manager)
+
+    def test_prefetch_of_primary_resident_block_is_redundant(self, manager_setup):
+        """Already-resident blocks are not promotions and stay out of the ratio."""
+        self._start_request()
+        block = to_keys([1])[0]
+        self.manager.prepare_store([block], _CTX)
+        self.manager.complete_store([block], _CTX, success=True)
+
+        assert self.manager.prefetch([block], _CTX) == 0
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_REDUNDANT) == 1
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_PROMOTED) == 0
+        assert block not in self.manager._prefetched
+        assert_prefetch_accounting(stats, self.manager)
+
+    def test_prefetch_tracking_overflow_is_untracked_not_wasted(self, manager_setup):
+        """Losing a tracking slot is not an outcome — the block may still be used.
+
+        Counting overflow as wasted would make the success rate a function of
+        prefetch_track_capacity and workload burst size rather than of prefetch
+        quality.
+        """
+        self._start_request()
+        self.manager._prefetch_track_capacity = 1
+        first, second = to_keys([1, 2])
+        self.secondary_tier1.blocks[first] = True
+        self.secondary_tier1.blocks[second] = True
+
+        assert self.manager.prefetch([first, second], _CTX) == 2
+
+        # Capacity is 1, so tracking the second key displaces the first.
+        assert first not in self.manager._prefetched
+        assert second in self.manager._prefetched
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_PROMOTED) == 2
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_UNTRACKED) == 1
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_WASTED) == 0
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_USEFUL) == 0
+        assert_prefetch_accounting(stats, self.manager)
+
+    def test_repeated_prefetch_resolves_previous_record_as_wasted(self, manager_setup):
+        """Re-promoting a tracked key must not silently drop its first record.
+
+        A second promotion can only start once the block has left the primary
+        tier, so the record being replaced resolved as wasted. Without this,
+        two promotions would yield at most one outcome.
+        """
+        self._start_request()
+        block = to_keys([1])[0]
+        self._promote_by_prefetch(block)
+
+        # Evict the promoted copy, then release the filler's ref_cnt so the
+        # primary tier has a slot free for a second promotion.
+        filler = to_keys(range(10, 15))
+        result = self.manager.prepare_store(filler, _CTX)
+        assert result is not None
+        assert block in result.evicted_keys
+        self.manager.complete_store(filler, _CTX, success=True)
+        # Two steps: the first flushes the cascades, the second drains them so
+        # the filler stops holding ref_cnt and the primary tier has a free slot.
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+
+        # Second prefetch of the same key, before any demand lookup resolved it.
+        self.secondary_tier1.blocks[block] = True
+        assert self.manager.prefetch([block], _CTX) == 1
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        promoted = counter_total(stats, TieringOffloadingMetrics.PREFETCH_PROMOTED)
+        useful = counter_total(stats, TieringOffloadingMetrics.PREFETCH_USEFUL)
+        wasted = counter_total(stats, TieringOffloadingMetrics.PREFETCH_WASTED)
+        untracked = counter_total(stats, TieringOffloadingMetrics.PREFETCH_UNTRACKED)
+
+        assert promoted == 2
+        # The first record resolved as wasted; the second is still tracked.
+        assert wasted == 1
+        assert useful == 0
+        assert untracked == 0
+        assert block in self.manager._prefetched
+        # Every promotion is accounted for: one resolved, one still in flight.
+        assert_prefetch_accounting(stats, self.manager)
+
+    def test_prefetch_outcome_tracking_disabled_reports_untracked(self, manager_setup):
+        """Capacity 0 must still account for promotions, not drop them silently.
+
+        Otherwise the accounting invariant breaks and a dashboard cannot tell a
+        disabled tracker from a prefetch that never promotes anything.
+        """
+        self._start_request()
+        self.manager._prefetch_track_capacity = 0
+        block = to_keys([1])[0]
+        self.secondary_tier1.blocks[block] = True
+
+        assert self.manager.prefetch([block], _CTX) == 1
+        assert not self.manager._prefetched
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        promoted = counter_total(stats, TieringOffloadingMetrics.PREFETCH_PROMOTED)
+        untracked = counter_total(stats, TieringOffloadingMetrics.PREFETCH_UNTRACKED)
+        assert promoted == 1
+        # Tracking off: untracked == promoted signals "ratio has no samples".
+        assert untracked == 1
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_WASTED) == 0
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_USEFUL) == 0
+        assert_prefetch_accounting(stats, self.manager)
 
     def test_lookup_reports_sync_delay_for_resolved_lookups(self, manager_setup):
         """Resolved lookups report one sync delay sample on allocation."""

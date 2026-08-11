@@ -42,6 +42,10 @@ class TieringOffloadingMetrics:
     PREFETCH_ATTEMPTED = "vllm:kv_offload_tiering_prefetch_attempted"
     PREFETCH_PROMOTED = "vllm:kv_offload_tiering_prefetch_promoted"
     PREFETCH_SKIPPED = "vllm:kv_offload_tiering_prefetch_skipped"
+    PREFETCH_REDUNDANT = "vllm:kv_offload_tiering_prefetch_redundant"
+    PREFETCH_USEFUL = "vllm:kv_offload_tiering_prefetch_useful"
+    PREFETCH_WASTED = "vllm:kv_offload_tiering_prefetch_wasted"
+    PREFETCH_UNTRACKED = "vllm:kv_offload_tiering_prefetch_untracked"
 
 
 @dataclass

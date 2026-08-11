@@ -18,6 +18,10 @@ Configuration via kv_connector_extra_config:
     registered via CachePolicyFactory
   - prefetch_chunks: (optional) number of additional chunks to proactively
     promote on the first secondary-tier miss (default: 0)
+  - prefetch_track_capacity: (optional) max prefetch-promoted keys tracked to
+    attribute the useful/wasted outcome counters; 0 disables outcome tracking,
+    in which case every promotion is counted as PREFETCH_UNTRACKED
+    (default: 8192)
   - secondary_tiers: (optional) List of secondary tier configurations
     Each secondary tier config is a dict with:
       - type: (required) Type of secondary tier (e.g., "example", "storage", "network")
@@ -58,6 +62,7 @@ from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.tiering.base import TieringOffloadingMetrics
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.manager import (
+    DEFAULT_PREFETCH_TRACK_CAPACITY,
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
 )
@@ -154,6 +159,47 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             ),
             labelnames=("tier",),
         )
+        metrics[TieringOffloadingMetrics.PREFETCH_REDUNDANT] = (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of prefetch chunks that were already resident in the "
+                    "primary tier, so no promotion was initiated. Subset of "
+                    "PREFETCH_ATTEMPTED, excluded from PREFETCH_PROMOTED."
+                ),
+                labelnames=("tier",),
+            )
+        )
+        metrics[TieringOffloadingMetrics.PREFETCH_USEFUL] = OffloadingCounterMetadata(
+            documentation=(
+                "Number of prefetch-promoted chunks that a later demand lookup "
+                "found in the primary tier, labeled by tier. Subset of "
+                "PREFETCH_PROMOTED."
+            ),
+            labelnames=("tier",),
+        )
+        metrics[TieringOffloadingMetrics.PREFETCH_WASTED] = OffloadingCounterMetadata(
+            documentation=(
+                "Number of prefetch-promoted chunks dropped from the primary tier "
+                "before any demand lookup reached them, labeled by tier. Subset "
+                "of PREFETCH_PROMOTED; the complement of PREFETCH_USEFUL."
+            ),
+            labelnames=("tier",),
+        )
+        metrics[TieringOffloadingMetrics.PREFETCH_UNTRACKED] = (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of prefetch-promoted chunks whose outcome was never "
+                    "determined, because prefetch_track_capacity was exceeded or "
+                    "is 0 (tracking disabled), labeled by tier. Not an outcome: "
+                    "these chunks may still have been used. Equal to "
+                    "PREFETCH_PROMOTED means tracking is off and the "
+                    "useful/wasted ratio has no samples; a smaller non-trivial "
+                    "value means it is under-sampled and the capacity should be "
+                    "raised."
+                ),
+                labelnames=("tier",),
+            )
+        )
 
         secondary_tier_configs = extra_config.get("secondary_tiers", [])
         if not isinstance(secondary_tier_configs, list):
@@ -182,6 +228,17 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 f"prefetch_chunks must be a non-negative int, got {prefetch_chunks!r}"
             )
         self.prefetch_chunks = prefetch_chunks
+
+        # Keys tracked for prefetch outcome metrics (useful vs wasted)
+        prefetch_track_capacity = self.extra_config.get(
+            "prefetch_track_capacity", DEFAULT_PREFETCH_TRACK_CAPACITY
+        )
+        if not isinstance(prefetch_track_capacity, int) or prefetch_track_capacity < 0:
+            raise ValueError(
+                "prefetch_track_capacity must be a non-negative int, got "
+                f"{prefetch_track_capacity!r}"
+            )
+        self.prefetch_track_capacity = prefetch_track_capacity
 
         # Scheduler-side mmap (rank=None); kept for cleanup
         self._scheduler_mmap: SharedOffloadRegion | None = None
@@ -253,6 +310,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 primary_tier=primary_tier,
                 secondary_tiers=secondary_tiers,
                 prefetch_chunks=self.prefetch_chunks,
+                prefetch_track_capacity=self.prefetch_track_capacity,
             )
             if int(self.extra_config.get("store_threshold", 0)) >= 2:
                 raise ValueError(
