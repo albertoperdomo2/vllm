@@ -38,6 +38,13 @@ from vllm.v1.kv_offload.base import (
     TierMatcher,
     make_offload_key,
 )
+from vllm.v1.kv_offload.config import (
+    OffloadingCacheConfig,
+    OffloadingConfig,
+    OffloadingGroupConfig,
+    OffloadingModelConfig,
+    OffloadingParallelConfig,
+)
 from vllm.v1.kv_offload.tiering.base import (
     JobMetadata,
     JobResult,
@@ -64,6 +71,34 @@ def _mock_mmap_region(num_blocks: int, row_bytes: int = 16):
     return mock
 
 
+def _make_tiering_spec(
+    extra_config: dict[str, object] | None = None,
+) -> TieringOffloadingSpec:
+    config = OffloadingConfig(
+        groups=(OffloadingGroupConfig(16, ("layer",)),),
+        worker_kv_bytes_per_block=8,
+        enable_kv_cache_events=False,
+        extra_config={
+            "cpu_bytes_to_use": 65536,
+            **(extra_config or {}),
+        },
+        engine_id="test-engine",
+        model=OffloadingModelConfig(name="test-model", dtype="float16"),
+        cache=OffloadingCacheConfig(tokens_per_hash=16, blocks_per_chunk=1),
+        parallel=OffloadingParallelConfig(
+            rank=0,
+            world_size=1,
+            tp_size=1,
+            pp_size=1,
+            pcp_size=1,
+            dcp_size=1,
+            data_parallel_index=0,
+            is_parallelism_agnostic=False,
+        ),
+    )
+    return TieringOffloadingSpec(config)
+
+
 def to_keys(int_ids: Iterable[int]) -> list[OffloadKey]:
     return [make_offload_key(str(i).encode(), 0) for i in int_ids]
 
@@ -74,7 +109,7 @@ def counter_total(stats: OffloadingConnectorStats, name: str) -> float:
 
 
 def assert_prefetch_accounting(stats: OffloadingConnectorStats, manager) -> None:
-    """Every prefetch promotion is resolved, untracked, or still tracked.
+    """Every prefetch promotion is resolved, failed, or still tracked.
 
     This must hold unconditionally — including when tracking is disabled —
     otherwise promotions vanish from the accounting and the useful/wasted
@@ -85,6 +120,7 @@ def assert_prefetch_accounting(stats: OffloadingConnectorStats, manager) -> None
         counter_total(stats, TieringOffloadingMetrics.PREFETCH_USEFUL)
         + counter_total(stats, TieringOffloadingMetrics.PREFETCH_WASTED)
         + counter_total(stats, TieringOffloadingMetrics.PREFETCH_UNTRACKED)
+        + counter_total(stats, TieringOffloadingMetrics.PREFETCH_LOAD_FAILED)
         + len(manager._prefetched)
     )
     assert accounted == promoted
@@ -178,10 +214,71 @@ def test_tiering_spec_defines_prefetch_outcome_metrics():
         TieringOffloadingMetrics.PREFETCH_WASTED,
         TieringOffloadingMetrics.PREFETCH_REDUNDANT,
         TieringOffloadingMetrics.PREFETCH_UNTRACKED,
+        TieringOffloadingMetrics.PREFETCH_LOAD_FAILED,
+        TieringOffloadingMetrics.PREFETCH_LATE,
     ):
         metadata = metrics[name]
         assert isinstance(metadata, OffloadingCounterMetadata)
         assert metadata.labelnames == ("tier",)
+
+
+def test_tiering_spec_defaults_admission_prefetch_chunks_to_zero():
+    spec = _make_tiering_spec()
+
+    assert spec.admission_prefetch_chunks == 0
+
+
+def test_tiering_manager_accepts_positive_admission_prefetch_chunks():
+    mock_region = _mock_mmap_region(5)
+    primary_tier = CPUPrimaryTierOffloadingManager(
+        num_blocks=5, mmap_region=mock_region
+    )
+    secondary_tier = ExampleSecondaryTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=mock_region.create_kv_memoryview(),
+        tier_type="example",
+    )
+
+    manager = TieringOffloadingManager(
+        primary_tier=primary_tier,
+        secondary_tiers=[secondary_tier],
+        admission_prefetch_chunks=100,
+    )
+
+    assert manager._admission_prefetch_chunks == 100
+
+
+@pytest.mark.parametrize("value", [-1, -100])
+def test_tiering_spec_rejects_negative_admission_prefetch_chunks(value):
+    with pytest.raises(
+        ValueError,
+        match="admission_prefetch_chunks must be a non-negative int",
+    ):
+        _make_tiering_spec({"admission_prefetch_chunks": value})
+
+
+@pytest.mark.parametrize("value", [False, True])
+def test_tiering_spec_rejects_boolean_admission_prefetch_chunks(value):
+    with pytest.raises(
+        ValueError,
+        match="admission_prefetch_chunks must be a non-negative int",
+    ):
+        _make_tiering_spec({"admission_prefetch_chunks": value})
+
+
+def test_enabled_admission_prefetch_requires_secondary_tier():
+    primary_tier = CPUPrimaryTierOffloadingManager(
+        num_blocks=5, mmap_region=_mock_mmap_region(5)
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="admission_prefetch_chunks requires at least one secondary tier",
+    ):
+        TieringOffloadingManager(
+            primary_tier=primary_tier,
+            admission_prefetch_chunks=1,
+        )
 
 
 def test_tiering_manager_aggregates_secondary_stats():
@@ -444,10 +541,171 @@ class TestTieringOffloadingManager:
         # Next lookup should succeed
         assert count_hits(self.manager, blocks) == 3
 
-    def _promote_by_prefetch(self, block: OffloadKey) -> None:
-        """Prefetch one block out of secondary_tier1 and let the job complete."""
+    def test_prefetch_assume_resident_promotes_without_secondary_lookup(
+        self, manager_setup
+    ):
+        """Blind prefetch batches assumed-resident keys under the real tier."""
+        self._start_request()
+        blocks = to_keys(range(3))
+        for block in blocks:
+            self.secondary_tier1.blocks[block] = True
+        self.secondary_tier1.lookup = MagicMock(wraps=self.secondary_tier1.lookup)
+        self.secondary_tier1.submit_load = MagicMock(
+            wraps=self.secondary_tier1.submit_load
+        )
+
+        initiated = self.manager.prefetch_assume_resident(blocks, _CTX, tier_idx=0)
+
+        assert initiated == len(blocks)
+        self.secondary_tier1.lookup.assert_not_called()
+        self.secondary_tier1.submit_load.assert_not_called()
+
+        self._simulate_on_schedule_end()
+        self.secondary_tier1.submit_load.assert_called_once()
+        job_metadata = self.secondary_tier1.submit_load.call_args.args[0]
+        assert job_metadata.keys == blocks
+
+        self._simulate_on_schedule_end()
+        assert all(
+            self.primary_tier.lookup(block, _CTX) is LookupResult.HIT
+            for block in blocks
+        )
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        tier_label = ("1:example",)
+        assert stats.data["data"][TieringOffloadingMetrics.PREFETCH_ATTEMPTED] == {
+            tier_label: len(blocks)
+        }
+        assert stats.data["data"][TieringOffloadingMetrics.PREFETCH_PROMOTED] == {
+            tier_label: len(blocks)
+        }
+
+    def test_prefetch_batches_one_hundred_keys_in_one_load_job(self):
+        mock_region = _mock_mmap_region(100)
+        primary_tier = CPUPrimaryTierOffloadingManager(
+            num_blocks=100, mmap_region=mock_region
+        )
+        secondary_tier = ExampleSecondaryTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=mock_region.create_kv_memoryview(),
+            tier_type="example",
+        )
+        manager = TieringOffloadingManager(
+            primary_tier=primary_tier,
+            secondary_tiers=[secondary_tier],
+        )
+        manager.on_new_request(_CTX)
+        blocks = to_keys(range(100))
+        secondary_tier.blocks.update(dict.fromkeys(blocks, True))
+        secondary_tier.submit_load = MagicMock(wraps=secondary_tier.submit_load)
+
+        assert manager.prefetch_assume_resident(blocks, _CTX) == 100
+        manager.on_schedule_end(
+            ScheduleEndContext(new_req_ids=(), preempted_req_ids=())
+        )
+
+        secondary_tier.submit_load.assert_called_once()
+        job_metadata = secondary_tier.submit_load.call_args.args[0]
+        assert job_metadata.keys == blocks
+        assert len(job_metadata.block_ids) == 100
+
+    def test_prefetch_primary_hit_is_redundant(self, manager_setup):
+        self._start_request()
+        block = to_keys([1])[0]
+        write_result = self.primary_tier.prepare_write([block], _CTX)
+        assert write_result is not None
+        self.primary_tier.complete_write([block], _CTX, success=True)
+
+        assert self.manager.prefetch_assume_resident([block], _CTX) == 0
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_REDUNDANT) == 1
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_PROMOTED) == 0
+
+    def test_prefetch_primary_hit_pending_is_redundant(self, manager_setup):
+        self._start_request()
+        block = to_keys([1])[0]
         self.secondary_tier1.blocks[block] = True
-        assert self.manager.prefetch([block], _CTX) == 1
+
+        assert self.manager.prefetch_assume_resident([block], _CTX) == 1
+        assert self.primary_tier.lookup(block, _CTX) is LookupResult.HIT_PENDING
+        assert self.manager.prefetch_assume_resident([block], _CTX) == 0
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_REDUNDANT) == 1
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_PROMOTED) == 1
+
+    def test_prefetch_primary_capacity_exhaustion_is_skipped(self, manager_setup):
+        self._start_request()
+        pending_blocks = to_keys(range(5))
+        assert self.primary_tier.prepare_write(pending_blocks, _CTX) is not None
+        candidate = to_keys([10])[0]
+        self.secondary_tier1.blocks[candidate] = True
+
+        assert self.manager.prefetch_assume_resident([candidate], _CTX) == 0
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_SKIPPED) == 1
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_PROMOTED) == 0
+
+    def test_prefetch_filtered_source_tier_is_skipped(self, manager_setup):
+        candidate = to_keys([1])[0]
+        self.secondary_tier1.blocks[candidate] = True
+        self.secondary_tier1.lookup = MagicMock(wraps=self.secondary_tier1.lookup)
+        ctx = ReqContext(
+            req_id="filtered-prefetch",
+            load_tier_filter=TierFilter(matchers=(TierMatcher(medium=Medium.STORAGE),)),
+        )
+        self._start_request(ctx)
+
+        assert self.manager.prefetch_assume_resident([candidate], ctx) == 0
+        self.secondary_tier1.lookup.assert_not_called()
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        tier_label = ("1:example",)
+        assert stats.data["data"][TieringOffloadingMetrics.PREFETCH_SKIPPED] == {
+            tier_label: 1
+        }
+
+    def test_prefetch_attempt_accounting_partitions_outcomes(self, manager_setup):
+        self._start_request()
+        redundant, promoted, skipped = to_keys(range(3))
+
+        write_result = self.primary_tier.prepare_write([redundant], _CTX)
+        assert write_result is not None
+        self.primary_tier.complete_write([redundant], _CTX, success=True)
+        assert self.primary_tier.prepare_read([redundant], _CTX) is not None
+        assert self.primary_tier.prepare_write(to_keys(range(10, 13)), _CTX)
+
+        self.secondary_tier1.blocks[promoted] = True
+        self.secondary_tier1.blocks[skipped] = True
+        assert (
+            self.manager.prefetch_assume_resident([redundant, promoted, skipped], _CTX)
+            == 1
+        )
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        attempted = counter_total(stats, TieringOffloadingMetrics.PREFETCH_ATTEMPTED)
+        partitioned = (
+            counter_total(stats, TieringOffloadingMetrics.PREFETCH_PROMOTED)
+            + counter_total(stats, TieringOffloadingMetrics.PREFETCH_REDUNDANT)
+            + counter_total(stats, TieringOffloadingMetrics.PREFETCH_SKIPPED)
+        )
+        assert attempted == 3
+        assert attempted == partitioned
+
+    def _queue_tracked_promotion(self, block: OffloadKey) -> None:
+        self.secondary_tier1.blocks[block] = True
+        assert self.manager.prefetch_assume_resident([block], _CTX) == 1
+
+    def _complete_tracked_promotion(self, block: OffloadKey) -> None:
+        self._queue_tracked_promotion(block)
         # Step 1 flushes the deferred submit_load(), step 2 processes the job.
         self._simulate_on_schedule_end()
         self._simulate_on_schedule_end()
@@ -456,7 +714,7 @@ class TestTieringOffloadingManager:
         """A demand lookup reaching a prefetched block counts it as useful."""
         self._start_request()
         block = to_keys([1])[0]
-        self._promote_by_prefetch(block)
+        self._complete_tracked_promotion(block)
 
         assert self.manager.lookup(block, _CTX) is LookupResult.HIT
 
@@ -473,7 +731,7 @@ class TestTieringOffloadingManager:
         """A prefetched block evicted before the demand scan counts as wasted."""
         self._start_request()
         block = to_keys([1])[0]
-        self._promote_by_prefetch(block)
+        self._complete_tracked_promotion(block)
 
         # Fill the 5-block primary tier, forcing the promoted block out.
         filler = to_keys(range(10, 15))
@@ -491,36 +749,113 @@ class TestTieringOffloadingManager:
         assert_prefetch_accounting(stats, self.manager)
 
     def test_prefetch_in_flight_promotion_stays_tracked(self, manager_setup):
-        """HIT_PENDING resolves on a later step, so it counts neither way yet."""
+        """The first HIT_PENDING is late once and can still become useful."""
         self._start_request()
         block = to_keys([1])[0]
-        self.secondary_tier1.blocks[block] = True
-        assert self.manager.prefetch([block], _CTX) == 1
+        self._queue_tracked_promotion(block)
 
         # The promotion is still in flight: primary holds the slot at ref_cnt=-1.
+        assert self.manager.lookup(block, _CTX) is LookupResult.HIT_PENDING
         assert self.manager.lookup(block, _CTX) is LookupResult.HIT_PENDING
 
         stats = self.manager.get_stats()
         assert stats is not None
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_LATE) == 1
         assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_USEFUL) == 0
         assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_WASTED) == 0
         assert block in self.manager._prefetched
+        assert block in self.manager._late_prefetches
         assert_prefetch_accounting(stats, self.manager)
 
-    def test_prefetch_of_primary_resident_block_is_redundant(self, manager_setup):
-        """Already-resident blocks are not promotions and stay out of the ratio."""
-        self._start_request()
-        block = to_keys([1])[0]
-        self.manager.prepare_store([block], _CTX)
-        self.manager.complete_store([block], _CTX, success=True)
-
-        assert self.manager.prefetch([block], _CTX) == 0
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+        assert self.manager.lookup(block, _CTX) is LookupResult.HIT
 
         stats = self.manager.get_stats()
         assert stats is not None
-        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_REDUNDANT) == 1
-        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_PROMOTED) == 0
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_LATE) == 0
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_USEFUL) == 1
         assert block not in self.manager._prefetched
+        assert block not in self.manager._late_prefetches
+
+    def test_failed_prefetch_is_load_failed_not_later_wasted(self, manager_setup):
+        """A failed assume-resident load has one terminal failure outcome."""
+        self._start_request()
+        missing = to_keys([1])[0]
+
+        assert self.manager.prefetch_assume_resident([missing], _CTX) == 1
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+
+        assert self.manager.lookup(missing, _CTX) is LookupResult.MISS
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_LOAD_FAILED) == 1
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_WASTED) == 0
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_USEFUL) == 0
+        assert missing not in self.manager._prefetched
+        assert missing not in self.manager._late_prefetches
+        assert self.manager._prefetch_job_keys == {}
+        assert_prefetch_accounting(stats, self.manager)
+
+    def test_failed_prefetch_recovers_through_reactive_lookup(self, manager_setup):
+        """Demand lookup can retry a key after its proactive load failed."""
+        self._start_request()
+        block = to_keys([1])[0]
+
+        assert self.manager.prefetch_assume_resident([block], _CTX) == 1
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+        assert self.primary_tier.lookup(block, _CTX) is LookupResult.MISS
+
+        self.secondary_tier1.blocks[block] = True
+        self.secondary_tier1.lookup = MagicMock(wraps=self.secondary_tier1.lookup)
+
+        assert self.manager.lookup(block, _CTX) is LookupResult.RETRY
+        self.secondary_tier1.lookup.assert_called_once_with(block, _CTX)
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+        assert self.manager.lookup(block, _CTX) is LookupResult.HIT
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_LOAD_FAILED) == 1
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_WASTED) == 0
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_USEFUL) == 0
+        assert block not in self.manager._prefetched
+        assert block not in self.manager._late_prefetches
+        assert_prefetch_accounting(stats, self.manager)
+
+    def test_mixed_promotion_failure_counts_only_prefetch_keys(self, manager_setup):
+        """A mixed failed batch attributes failure only to proactive keys."""
+        self._start_request()
+        demand, missing_prefetch = to_keys([1, 2])
+        self.secondary_tier1.blocks[demand] = True
+        self.secondary_tier1.submit_load = MagicMock(
+            wraps=self.secondary_tier1.submit_load
+        )
+
+        assert self.manager.lookup(demand, _CTX) is LookupResult.RETRY
+        assert self.manager.prefetch_assume_resident([missing_prefetch], _CTX) == 1
+
+        self._simulate_on_schedule_end()
+        self.secondary_tier1.submit_load.assert_called_once()
+        job_metadata = self.secondary_tier1.submit_load.call_args.args[0]
+        assert job_metadata.keys == [demand, missing_prefetch]
+        assert self.manager._prefetch_job_keys[job_metadata.job_id] == (
+            0,
+            (missing_prefetch,),
+        )
+
+        self._simulate_on_schedule_end()
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_LOAD_FAILED) == 1
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_WASTED) == 0
+        assert missing_prefetch not in self.manager._prefetched
+        assert self.manager._prefetch_job_keys == {}
         assert_prefetch_accounting(stats, self.manager)
 
     def test_prefetch_tracking_overflow_is_untracked_not_wasted(self, manager_setup):
@@ -533,13 +868,14 @@ class TestTieringOffloadingManager:
         self._start_request()
         self.manager._prefetch_track_capacity = 1
         first, second = to_keys([1, 2])
-        self.secondary_tier1.blocks[first] = True
-        self.secondary_tier1.blocks[second] = True
-
-        assert self.manager.prefetch([first, second], _CTX) == 2
+        self._queue_tracked_promotion(first)
+        assert self.manager.lookup(first, _CTX) is LookupResult.HIT_PENDING
+        assert first in self.manager._late_prefetches
+        self._queue_tracked_promotion(second)
 
         # Capacity is 1, so tracking the second key displaces the first.
         assert first not in self.manager._prefetched
+        assert first not in self.manager._late_prefetches
         assert second in self.manager._prefetched
 
         stats = self.manager.get_stats()
@@ -559,7 +895,11 @@ class TestTieringOffloadingManager:
         """
         self._start_request()
         block = to_keys([1])[0]
-        self._promote_by_prefetch(block)
+        self._queue_tracked_promotion(block)
+        assert self.manager.lookup(block, _CTX) is LookupResult.HIT_PENDING
+        assert block in self.manager._late_prefetches
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
 
         # Evict the promoted copy, then release the filler's ref_cnt so the
         # primary tier has a slot free for a second promotion.
@@ -573,9 +913,9 @@ class TestTieringOffloadingManager:
         self._simulate_on_schedule_end()
         self._simulate_on_schedule_end()
 
-        # Second prefetch of the same key, before any demand lookup resolved it.
-        self.secondary_tier1.blocks[block] = True
-        assert self.manager.prefetch([block], _CTX) == 1
+        # Queue the same key again before any demand lookup resolves its record.
+        self._queue_tracked_promotion(block)
+        assert block not in self.manager._late_prefetches
 
         stats = self.manager.get_stats()
         assert stats is not None
@@ -602,9 +942,7 @@ class TestTieringOffloadingManager:
         self._start_request()
         self.manager._prefetch_track_capacity = 0
         block = to_keys([1])[0]
-        self.secondary_tier1.blocks[block] = True
-
-        assert self.manager.prefetch([block], _CTX) == 1
+        self._queue_tracked_promotion(block)
         assert not self.manager._prefetched
 
         stats = self.manager.get_stats()
@@ -1167,6 +1505,32 @@ class TestTieringOffloadingManager:
 
         # Pending submission was dropped, not submitted.
         self.secondary_tier1.submit_load.assert_not_called()
+
+    def test_reset_cache_resolves_and_clears_prefetch_attribution(self, manager_setup):
+        self._start_request()
+        block = to_keys([1])[0]
+        self._queue_tracked_promotion(block)
+        assert self.manager.lookup(block, _CTX) is LookupResult.HIT_PENDING
+
+        # Flush the promotion. The synchronous example tier has completed it,
+        # but the manager has not consumed the completion or its provenance.
+        self._simulate_on_schedule_end()
+        assert self.manager._prefetch_job_keys
+        assert block in self.manager._prefetched
+        assert block in self.manager._late_prefetches
+
+        self.manager.reset_cache()
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_WASTED) == 1
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_USEFUL) == 0
+        assert self.manager._prefetched == {}
+        assert self.manager._late_prefetches == set()
+        assert self.manager._prefetch_job_keys == {}
+        assert self.manager._transfer_jobs == {}
+        assert self.manager._pending_load_submissions == {}
+        assert self.primary_tier.lookup(block, _CTX) is LookupResult.MISS
 
     def test_reset_cache_drains_all_tiers(self, manager_setup):
         """reset_cache must drain each secondary tier before resetting

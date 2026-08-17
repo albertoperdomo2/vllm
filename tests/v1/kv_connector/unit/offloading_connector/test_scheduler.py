@@ -21,8 +21,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     _ConnectorMetricName,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    GroupOffloadConfig,
     OffloadingConnectorScheduler,
     RequestOffloadState,
+    SchedulerOffloadConfig,
     is_store_reachable_swa_chunk,
 )
 from vllm.v1.core.kv_cache_utils import BlockHash
@@ -1093,6 +1095,166 @@ def _maximal_lookup(sched, keys, start_chunk_idx: int = 0):
     )
 
 
+def _make_admission_scheduler(
+    *,
+    admission_prefetch_chunks: int = 100,
+    group_configs: tuple[GroupOffloadConfig, ...] | None = None,
+) -> OffloadingConnectorScheduler:
+    if group_configs is None:
+        group_configs = (_make_admission_group_config(),)
+
+    manager = MagicMock()
+    manager.admission_prefetch_chunks = admission_prefetch_chunks
+    manager.prefetch_assume_resident = MagicMock()
+    manager.on_new_request.return_value = RequestOffloadingContext()
+
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.manager = manager
+    scheduler.config = SchedulerOffloadConfig(
+        kv_group_configs=group_configs,
+        blocks_per_chunk=1,
+        num_workers=1,
+        offload_prompt_only=True,
+    )
+    scheduler._req_status = {}
+    return scheduler
+
+
+def _make_admission_group_config(
+    *,
+    group_idx: int = 0,
+    sliding_window_size_in_chunks: int | None = None,
+    is_eagle_group: bool = False,
+) -> GroupOffloadConfig:
+    return GroupOffloadConfig(
+        group_idx=group_idx,
+        tokens_per_block=16,
+        tokens_per_chunk=16,
+        hashes_per_chunk=1,
+        kv_event_group_spec=MagicMock(),
+        sliding_window_size_in_chunks=sliding_window_size_in_chunks,
+        is_eagle_group=is_eagle_group,
+    )
+
+
+def _make_admission_request(
+    num_hashes: int,
+    *,
+    kv_transfer_params: dict | None = None,
+    request_id: str = "admission-request",
+):
+    return SimpleNamespace(
+        request_id=request_id,
+        kv_transfer_params=kv_transfer_params,
+        block_hashes=[BlockHash(str(i).encode()) for i in range(num_hashes)],
+    )
+
+
+class TestAdmissionPrefetch:
+    def test_marked_request_passes_first_one_hundred_ordered_keys(self):
+        scheduler = _make_admission_scheduler(admission_prefetch_chunks=100)
+        request = _make_admission_request(
+            125,
+            kv_transfer_params={"abc_admission_prefetch": True},
+        )
+
+        scheduler.on_new_request(request)
+
+        scheduler.manager.prefetch_assume_resident.assert_called_once()
+        keys, req_context = scheduler.manager.prefetch_assume_resident.call_args.args
+        assert keys == [
+            make_offload_key(block_hash, 0) for block_hash in request.block_hashes[:100]
+        ]
+        assert req_context.req_id == request.request_id
+        assert scheduler.manager.prefetch_assume_resident.call_args.kwargs == {
+            "tier_idx": 0
+        }
+
+    def test_short_prompt_passes_all_complete_chunks(self):
+        scheduler = _make_admission_scheduler(admission_prefetch_chunks=100)
+        request = _make_admission_request(
+            3,
+            kv_transfer_params={"abc_admission_prefetch": True},
+        )
+
+        scheduler.on_new_request(request)
+
+        keys = scheduler.manager.prefetch_assume_resident.call_args.args[0]
+        assert keys == [
+            make_offload_key(block_hash, 0) for block_hash in request.block_hashes
+        ]
+
+    @pytest.mark.parametrize(
+        "kv_transfer_params",
+        [None, {}, {"abc_admission_prefetch": False}, {"abc_admission_prefetch": 1}],
+        ids=["missing-params", "missing-flag", "false", "integer-one"],
+    )
+    def test_unmarked_request_does_not_prefetch(self, kv_transfer_params):
+        scheduler = _make_admission_scheduler()
+        request = _make_admission_request(3, kv_transfer_params=kv_transfer_params)
+
+        scheduler.on_new_request(request)
+
+        scheduler.manager.prefetch_assume_resident.assert_not_called()
+
+    def test_zero_configured_chunks_does_not_prefetch(self):
+        scheduler = _make_admission_scheduler(admission_prefetch_chunks=0)
+        request = _make_admission_request(
+            3,
+            kv_transfer_params={"abc_admission_prefetch": True},
+        )
+
+        scheduler.on_new_request(request)
+
+        scheduler.manager.prefetch_assume_resident.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "group_configs",
+        [
+            (_make_admission_group_config(sliding_window_size_in_chunks=2),),
+            (_make_admission_group_config(is_eagle_group=True),),
+            (
+                _make_admission_group_config(group_idx=0),
+                _make_admission_group_config(group_idx=1),
+            ),
+        ],
+        ids=["sliding-window", "eagle", "multiple-groups"],
+    )
+    def test_unsupported_group_layout_does_not_prefetch(self, group_configs):
+        scheduler = _make_admission_scheduler(group_configs=group_configs)
+        request = _make_admission_request(
+            3,
+            kv_transfer_params={"abc_admission_prefetch": True},
+        )
+
+        scheduler.on_new_request(request)
+
+        scheduler.manager.prefetch_assume_resident.assert_not_called()
+
+    def test_manager_and_connector_state_are_registered_before_prefetch(self):
+        scheduler = _make_admission_scheduler()
+        request = _make_admission_request(
+            3,
+            kv_transfer_params={"abc_admission_prefetch": True},
+        )
+        calls = []
+
+        def on_new_request(req_context):
+            calls.append("manager_on_new_request")
+            return RequestOffloadingContext()
+
+        def prefetch(keys, req_context, *, tier_idx):
+            calls.append("prefetch")
+            assert request.request_id in scheduler._req_status
+
+        scheduler.manager.on_new_request.side_effect = on_new_request
+        scheduler.manager.prefetch_assume_resident.side_effect = prefetch
+
+        scheduler.on_new_request(request)
+
+        assert calls == ["manager_on_new_request", "prefetch"]
+
+
 class TestMaximalPrefixLookup:
     def test_all_hit(self):
         sched = _make_scheduler_with_lookup({1: LookupResult.HIT, 2: LookupResult.HIT})
@@ -1122,6 +1284,14 @@ class TestMaximalPrefixLookup:
         sched = _make_scheduler_with_lookup({})
         assert _maximal_lookup(sched, to_keys([1, 2])) == 0
         sched._events_tracker.record_lookup.assert_not_called()
+
+    def test_miss_does_not_invoke_admission_prefetch(self):
+        sched = _make_scheduler_with_lookup({})
+        sched.manager.prefetch_assume_resident = MagicMock()
+
+        assert _maximal_lookup(sched, to_keys([1, 2])) == 0
+
+        sched.manager.prefetch_assume_resident.assert_not_called()
 
     def test_partial_prefix(self):
         sched = _make_scheduler_with_lookup({1: LookupResult.HIT, 2: LookupResult.HIT})

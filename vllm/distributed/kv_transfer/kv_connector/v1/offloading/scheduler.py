@@ -59,6 +59,7 @@ from vllm.v1.request import Request, RequestStatus
 logger = init_logger(__name__)
 
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
+ABC_ADMISSION_PREFETCH_KEY = "abc_admission_prefetch"
 MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
 
@@ -544,7 +545,7 @@ class OffloadingConnectorScheduler:
 
     def _maximal_prefix_lookup(
         self,
-        keys: Sequence[OffloadKey],
+        keys: Iterable[OffloadKey],
         req_context: ReqContext,
         req: Request,
         group_config: GroupOffloadConfig,
@@ -573,15 +574,6 @@ class OffloadingConnectorScheduler:
                     # async lookups (until a miss is detected).
                     defer_lookup = True
                 case LookupResult.MISS:
-                    # phase 1 toy prefetch hook
-                    # for now, we restrict the toy to full-attention groups
-                    # in the future, we might want to plug it in _sliding_window_lookup
-                    n = getattr(self.manager, "prefetch_chunks", 0)
-                    prefetch = getattr(self.manager, "prefetch", None)
-                    if n > 0 and prefetch is not None:
-                        upcoming = keys[local_idx + 1 : local_idx + 1 + n]
-                        if upcoming:
-                            prefetch(upcoming, req_context)
                     break
         return hit_count if not defer_lookup else None
 
@@ -810,6 +802,39 @@ class OffloadingConnectorScheduler:
 
         return num_hit_tokens
 
+    def _maybe_prefetch_on_admission(self, req_status: RequestOffloadState) -> None:
+        params = req_status.req_context.kv_transfer_params or {}
+        if params.get(ABC_ADMISSION_PREFETCH_KEY) is not True:
+            return
+
+        n = getattr(self.manager, "admission_prefetch_chunks", 0)
+        prefetch = getattr(self.manager, "prefetch_assume_resident", None)
+        if n <= 0 or prefetch is None:
+            return
+
+        if len(self.config.kv_group_configs) != 1:
+            logger.warning(
+                "Admission prefetch supports exactly one KV group; skipping %s",
+                req_status.req.request_id,
+            )
+            return
+
+        group_config = self.config.kv_group_configs[0]
+        if (
+            group_config.sliding_window_size_in_chunks is not None
+            or group_config.is_eagle_group
+        ):
+            logger.warning(
+                "Admission prefetch requires one stable full-attention group; "
+                "skipping %s",
+                req_status.req.request_id,
+            )
+            return
+
+        req_status.update_offload_keys()
+        keys = req_status.group_states[0].offload_keys[:n]
+        prefetch(keys, req_status.req_context, tier_idx=0)
+
     def on_new_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""
         req_context = _create_req_context(request)
@@ -821,6 +846,7 @@ class OffloadingConnectorScheduler:
             offloading_context=offloading_context,
         )
         self._req_status[request.request_id] = req_status
+        self._maybe_prefetch_on_admission(req_status)
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int

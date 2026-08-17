@@ -16,8 +16,6 @@ Configuration via kv_connector_extra_config:
   - cache_policy_module_path: (optional) Python import path to load
     eviction_policy from when it names an out-of-tree CachePolicy not
     registered via CachePolicyFactory
-  - prefetch_chunks: (optional) number of additional chunks to proactively
-    promote on the first secondary-tier miss (default: 0)
   - prefetch_track_capacity: (optional) max prefetch-promoted keys tracked to
     attribute the useful/wasted outcome counters; 0 disables outcome tracking,
     in which case every promotion is counted as PREFETCH_UNTRACKED
@@ -138,8 +136,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         metrics[TieringOffloadingMetrics.PREFETCH_ATTEMPTED] = (
             OffloadingCounterMetadata(
                 documentation=(
-                    "Number of KV cache chunks passed to prefetch() for proactive "
-                    "promotion, labeled by tier. Phase 1 toy read-ahead."
+                    "Number of KV cache chunks selected for proactive promotion, "
+                    "labeled by source tier."
                 ),
                 labelnames=("tier",),
             )
@@ -153,9 +151,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         )
         metrics[TieringOffloadingMetrics.PREFETCH_SKIPPED] = OffloadingCounterMetadata(
             documentation=(
-                "Number of prefetch chunks skipped (not in any secondary tier, "
-                "or primary tier full), labeled by tier. Subset of "
-                "PREFETCH_ATTEMPTED."
+                "Number of selected prefetch chunks that did not initiate a "
+                "promotion, labeled by source tier. Subset of PREFETCH_ATTEMPTED."
             ),
             labelnames=("tier",),
         )
@@ -200,6 +197,21 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 labelnames=("tier",),
             )
         )
+        metrics[TieringOffloadingMetrics.PREFETCH_LOAD_FAILED] = (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Proactively selected chunks in an asynchronous promotion job that "
+                    "completed unsuccessfully."
+                ),
+                labelnames=("tier",),
+            )
+        )
+        metrics[TieringOffloadingMetrics.PREFETCH_LATE] = OffloadingCounterMetadata(
+            documentation=(
+                "Proactively promoted chunks whose first demand lookup saw HIT_PENDING."
+            ),
+            labelnames=("tier",),
+        )
 
         secondary_tier_configs = extra_config.get("secondary_tiers", [])
         if not isinstance(secondary_tier_configs, list):
@@ -221,13 +233,20 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         if not isinstance(self.secondary_tier_configs, list):
             raise ValueError("secondary_tiers must be a list of tier configurations")
 
-        # Prefetch chunks
-        prefetch_chunks = self.extra_config.get("prefetch_chunks", 0)
-        if not isinstance(prefetch_chunks, int) or prefetch_chunks < 0:
+        admission_prefetch_chunks = self.extra_config.get(
+            "admission_prefetch_chunks", 0
+        )
+
+        if (
+            not isinstance(admission_prefetch_chunks, int)
+            or isinstance(admission_prefetch_chunks, bool)
+            or admission_prefetch_chunks < 0
+        ):
             raise ValueError(
-                f"prefetch_chunks must be a non-negative int, got {prefetch_chunks!r}"
+                "admission_prefetch_chunks must be a non-negative int, got "
+                f"{admission_prefetch_chunks!r}"
             )
-        self.prefetch_chunks = prefetch_chunks
+        self.admission_prefetch_chunks = admission_prefetch_chunks
 
         # Keys tracked for prefetch outcome metrics (useful vs wasted)
         prefetch_track_capacity = self.extra_config.get(
@@ -309,7 +328,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             tiering_manager = TieringOffloadingManager(
                 primary_tier=primary_tier,
                 secondary_tiers=secondary_tiers,
-                prefetch_chunks=self.prefetch_chunks,
+                admission_prefetch_chunks=self.admission_prefetch_chunks,
                 prefetch_track_capacity=self.prefetch_track_capacity,
             )
             if int(self.extra_config.get("store_threshold", 0)) >= 2:

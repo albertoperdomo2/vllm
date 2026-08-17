@@ -57,11 +57,6 @@ from vllm.v1.kv_offload.tiering.base import (
 
 logger = init_logger(__name__)
 
-# Label used for prefetch counters that cannot be attributed to a tier: every
-# attempt (the tier is unknown until the lookup returns) and blocks that were
-# not resident in any secondary tier.
-PREFETCH_TIER_LABEL: tuple[str] = ("prefetch",)
-
 # Max prefetch-promoted keys tracked to attribute the useful/wasted outcome
 # counters. At ~36 bytes per key this is a few hundred KB. 0 disables tracking,
 # which reports every promotion as untracked rather than dropping it.
@@ -75,6 +70,7 @@ class PendingPromotion:
     req_context: ReqContext
     keys: list[OffloadKey] = field(default_factory=list)
     block_ids: list[int] = field(default_factory=list)
+    prefetch_keys: list[OffloadKey] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -189,7 +185,7 @@ class TieringOffloadingManager(OffloadingManager):
         self,
         primary_tier: CPUPrimaryTierOffloadingManager,
         secondary_tiers: list[SecondaryTierManager] | None = None,
-        prefetch_chunks: int = 0,
+        admission_prefetch_chunks: int = 0,
         prefetch_track_capacity: int = DEFAULT_PREFETCH_TRACK_CAPACITY,
     ):
         """
@@ -199,34 +195,27 @@ class TieringOffloadingManager(OffloadingManager):
             primary_tier: The primary tier manager (CPU-based).
             secondary_tiers: List of secondary tier managers (e.g., Storage,
                             Network). Can be None or empty list.
-            prefetch_chunks: Number of chunks prefetch() promotes per call.
             prefetch_track_capacity: Max keys tracked for prefetch outcome
                             metrics. 0 disables outcome tracking, counting
                             every promotion as PREFETCH_UNTRACKED.
         """
         self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
-        self._prefetch_chunks = prefetch_chunks
+        self._admission_prefetch_chunks = admission_prefetch_chunks
         self._prefetch_track_capacity = prefetch_track_capacity
+        self._late_prefetches: set[OffloadKey] = set()
 
-        # Keys promoted by prefetch() that are awaiting a demand lookup, oldest
+        if self._admission_prefetch_chunks > 0 and not self.secondary_tiers:
+            raise ValueError(
+                "admission_prefetch_chunks requires at least one secondary tier"
+            )
+
+        # Proactively promoted keys awaiting a demand lookup, oldest
         # first; value is the originating tier index so the outcome counters
         # carry the same tier label as PREFETCH_PROMOTED.
-        #
-        # Deliberately global rather than per-request: block hashes are prefix
-        # chained, so a block after a demand MISS is unreachable in *any*
-        # request's prefix until the missing block is restored. The only payoff
-        # path is therefore cross-request, which per-request tracking cannot
-        # attribute.
+        # Tracking is global because the same content-addressed block may be
+        # consumed by a request other than the one that initiated its promotion.
         self._prefetched: OrderedDict[OffloadKey, int] = OrderedDict()
-
-        if self._prefetch_chunks > 0:
-            logger.info(
-                "Phase 1 naive prefetch enabled: prefetch_chunks=%d, "
-                "prefetch_track_capacity=%d",
-                self._prefetch_chunks,
-                self._prefetch_track_capacity,
-            )
 
         self._job_id_counter: int = 0
         # Job tracking: maps job_id to metadata for all in-flight transfers.
@@ -234,6 +223,8 @@ class TieringOffloadingManager(OffloadingManager):
         #   True:  secondary → primary (promotion)
         #   False: primary → secondary (cascade)
         self._transfer_jobs: dict[JobId, JobMetadata] = {}
+
+        self._prefetch_job_keys: dict[JobId, tuple[int, tuple[OffloadKey, ...]]] = {}
 
         # Pending promotion requests accumulated during lookup() calls; flushed
         # as one batched submit_load() per (tier, request) in on_schedule_end().
@@ -261,10 +252,6 @@ class TieringOffloadingManager(OffloadingManager):
         # Buffers manager-level observations (e.g. lookup delay) between
         # get_stats() calls; merged in and reset each time get_stats() runs.
         self._stats = OffloadingConnectorStats()
-
-    @property
-    def prefetch_chunks(self) -> int:
-        return self._prefetch_chunks
 
     def _next_job_id(self) -> JobId:
         """Generate a unique job ID for async transfer tracking."""
@@ -305,6 +292,8 @@ class TieringOffloadingManager(OffloadingManager):
                     f" ({tier.tier_type}) not in _transfer_jobs"
                 )
 
+                prefetch_job = self._prefetch_job_keys.pop(job_id, None)
+
                 if job_metadata.is_promotion:
                     # secondary→primary transfer (promotion) completed.
                     # Make blocks available in primary tier.
@@ -313,6 +302,17 @@ class TieringOffloadingManager(OffloadingManager):
                         job_metadata.req_context,
                         completed_job.success,
                     )
+
+                    if prefetch_job is not None and not completed_job.success:
+                        tier_idx, prefetch_keys = prefetch_job
+                        self._stats.increase_counter(
+                            TieringOffloadingMetrics.PREFETCH_LOAD_FAILED,
+                            len(prefetch_keys),
+                            self._tier_label(tier_idx),
+                        )
+                        for key in prefetch_keys:
+                            self._prefetched.pop(key, None)
+                            self._late_prefetches.discard(key)
                 else:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary blocks.
@@ -323,88 +323,67 @@ class TieringOffloadingManager(OffloadingManager):
     def _tier_label(self, tier_idx: int) -> tuple[str]:
         return (f"{tier_idx + 1}:{self.secondary_tiers[tier_idx].tier_type}",)
 
-    def _try_promote(
-        self,
-        key: OffloadKey,
-        req_context: ReqContext,
-        exclude_tier_idx: int | None = None,
-    ) -> tuple[bool, int | None]:
-        """Returns (promoted: bool, tier_idx: int | None).
+    def prefetch_assume_resident(
+        self, keys: Sequence[OffloadKey], req_context: ReqContext, tier_idx: int = 0
+    ) -> int:
+        """Queue assume-resident secondary blocks for promotion to CPU"""
 
-        tier_idx is the secondary tier the promotion was attempted on (for
-        metrics labeling), or None if the block was not in any tier.
-        """
+        if not keys:
+            return 0
+        if tier_idx < 0 or tier_idx >= len(self.secondary_tiers):
+            raise IndexError(f"secondary tier index out of range: {tier_idx}")
 
-        primary_hit = self.primary_tier.lookup(key, req_context)
-        if primary_hit in (LookupResult.HIT, LookupResult.HIT_PENDING):
-            return True, None  # already a primary resident
-
-        for i, tier in enumerate(self.secondary_tiers):
-            if i == exclude_tier_idx:
-                continue
-            if not req_context.load_tier_filter.allows(tier.medium, tier.locality):
-                continue
-
-            result = tier.lookup(key, req_context)
-            if result is LookupResult.HIT:
-                promoted = self._initiate_promotion(tier, key, req_context)
-                return promoted, i
-
-        return False, None
-
-    def prefetch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> int:
-        """Proactively promote up to len(keys) chunks that are in a secondary tier.
-
-        Phase 1: called by the connector scheduler with the next N keys after
-        the first miss. Returns the number of promotions actually initiated.
-        Skips blocks already primary-resident, blocks not in any secondary tier,
-        and blocks the primary tier had no room for.
-        """
-
+        self._maybe_process_finished_jobs()
+        tier = self.secondary_tiers[tier_idx]
+        label = self._tier_label(tier_idx)
         initiated = 0
-        for key in keys:
-            promoted, tier_idx = self._try_promote(key, req_context)
 
-            # every key passed to prefetch() is an attempt, labeled with the
-            # aggregate prefetch label (we don't know the tier until _try_promote
-            # returns, and absent blocks have no tier at all)
+        for key in keys:
             self._stats.increase_counter(
                 TieringOffloadingMetrics.PREFETCH_ATTEMPTED,
-                labelvalues=PREFETCH_TIER_LABEL,
+                labelvalues=label,
             )
 
-            if promoted and tier_idx is not None:
-                # a secondary->primary promotion was actually initiated
+            if not req_context.load_tier_filter.allows(
+                tier.medium,
+                tier.locality,
+            ):
+                self._stats.increase_counter(
+                    TieringOffloadingMetrics.PREFETCH_SKIPPED,
+                    labelvalues=label,
+                )
+                continue
+
+            primary_result = self.primary_tier.lookup(key, req_context)
+            if primary_result in (
+                LookupResult.HIT,
+                LookupResult.HIT_PENDING,
+            ):
+                self._stats.increase_counter(
+                    TieringOffloadingMetrics.PREFETCH_REDUNDANT,
+                    labelvalues=label,
+                )
+                continue
+
+            assert primary_result is LookupResult.MISS
+            if self._initiate_promotion(tier, key, req_context, is_prefetch=True):
                 initiated += 1
                 self._stats.increase_counter(
                     TieringOffloadingMetrics.PREFETCH_PROMOTED,
-                    labelvalues=self._tier_label(tier_idx),
+                    labelvalues=label,
                 )
                 self._track_prefetched(key, tier_idx)
-            elif promoted:
-                # already primary-resident: no promotion happened, so this is
-                # not part of the useful/wasted denominator
-                self._stats.increase_counter(
-                    TieringOffloadingMetrics.PREFETCH_REDUNDANT,
-                    labelvalues=PREFETCH_TIER_LABEL,
-                )
-            elif tier_idx is not None:
-                # was in a secondary tier but primary was full
-                self._stats.increase_counter(
-                    TieringOffloadingMetrics.PREFETCH_SKIPPED,
-                    labelvalues=self._tier_label(tier_idx),
-                )
             else:
-                # not in any secondary tier
                 self._stats.increase_counter(
                     TieringOffloadingMetrics.PREFETCH_SKIPPED,
-                    labelvalues=PREFETCH_TIER_LABEL,
+                    labelvalues=label,
                 )
 
         return initiated
 
     def _track_prefetched(self, key: OffloadKey, tier_idx: int) -> None:
         """Record a prefetch-promoted key until a demand lookup resolves it."""
+        self._late_prefetches.discard(key)
         if self._prefetch_track_capacity <= 0:
             # Tracking disabled: still account for the promotion, so that
             # useful + wasted + untracked + tracked == promoted holds
@@ -418,9 +397,8 @@ class TieringOffloadingManager(OffloadingManager):
 
         previous_tier_idx = self._prefetched.pop(key, None)
         if previous_tier_idx is not None:
-            # _try_promote only initiates a promotion when the block is absent
-            # from the primary tier, so this second promotion proves the copy
-            # the earlier record was tracking has since left it: wasted.
+            # A second promotion means the copy tracked by the earlier record
+            # has left the primary tier without a demand hit.
             self._stats.increase_counter(
                 TieringOffloadingMetrics.PREFETCH_WASTED,
                 labelvalues=self._tier_label(previous_tier_idx),
@@ -429,7 +407,8 @@ class TieringOffloadingManager(OffloadingManager):
         self._prefetched[key] = tier_idx
 
         while len(self._prefetched) > self._prefetch_track_capacity:
-            _, dropped_tier_idx = self._prefetched.popitem(last=False)
+            dropped_key, dropped_tier_idx = self._prefetched.popitem(last=False)
+            self._late_prefetches.discard(dropped_key)
             # A bookkeeping limit, not an outcome: the block may well still be
             # resident and used later. Counting it wasted would make the success
             # rate a function of tracking capacity and burst size.
@@ -445,9 +424,9 @@ class TieringOffloadingManager(OffloadingManager):
 
         HIT means the demand scan found the block the prefetch promoted, so the
         prefetch paid off. MISS means it was promoted and then dropped from the
-        primary tier before the demand scan reached it. HIT_PENDING leaves the
-        key tracked: the promotion is still in flight and resolves on a later
-        step.
+        primary tier before the demand scan reached it. The first HIT_PENDING
+        marks the prefetch late while leaving it tracked so it can still resolve
+        as useful or wasted on a later step.
         """
         tier_idx = self._prefetched.get(key)
         if tier_idx is None:
@@ -455,14 +434,24 @@ class TieringOffloadingManager(OffloadingManager):
 
         if primary_hit is LookupResult.HIT:
             del self._prefetched[key]
+            self._late_prefetches.discard(key)
             self._stats.increase_counter(
                 TieringOffloadingMetrics.PREFETCH_USEFUL,
                 labelvalues=self._tier_label(tier_idx),
             )
         elif primary_hit is LookupResult.MISS:
             del self._prefetched[key]
+            self._late_prefetches.discard(key)
             self._stats.increase_counter(
                 TieringOffloadingMetrics.PREFETCH_WASTED,
+                labelvalues=self._tier_label(tier_idx),
+            )
+        elif (
+            primary_hit is LookupResult.HIT_PENDING and key not in self._late_prefetches
+        ):
+            self._late_prefetches.add(key)
+            self._stats.increase_counter(
+                TieringOffloadingMetrics.PREFETCH_LATE,
                 labelvalues=self._tier_label(tier_idx),
             )
 
@@ -572,6 +561,8 @@ class TieringOffloadingManager(OffloadingManager):
         tier: SecondaryTierManager,
         key: OffloadKey,
         req_context: ReqContext,
+        *,
+        is_prefetch: bool = False,
     ) -> bool:
         """
         Queue a block for promotion from a secondary tier to the primary tier.
@@ -614,6 +605,10 @@ class TieringOffloadingManager(OffloadingManager):
         entry = tier_pending[ctx_id]
         entry.keys.extend(primary_write_result.keys_to_store)
         entry.block_ids.extend(store_spec.block_ids)
+
+        if is_prefetch:
+            entry.prefetch_keys.extend(primary_write_result.keys_to_store)
+
         return True
 
     def _flush_pending_promotions(self) -> None:
@@ -636,6 +631,14 @@ class TieringOffloadingManager(OffloadingManager):
                     req_context=entry.req_context,
                 )
                 self._transfer_jobs[job_id] = job_metadata
+
+                if entry.prefetch_keys:
+                    tier_idx = self.secondary_tiers.index(tier)
+                    self._prefetch_job_keys[job_id] = (
+                        tier_idx,
+                        tuple(entry.prefetch_keys),
+                    )
+
                 tier.submit_load(job_metadata)
 
         self._pending_load_submissions.clear()
@@ -985,6 +988,17 @@ class TieringOffloadingManager(OffloadingManager):
         # All tier I/O has stopped; consume their completion notifications
         # so manager bookkeeping is consistent before the primary reset.
         self._process_finished_jobs()
+        assert not self._prefetch_job_keys, (
+            "Prefetch job provenance remained after draining secondary tiers"
+        )
+
+        for tier_idx in self._prefetched.values():
+            self._stats.increase_counter(
+                TieringOffloadingMetrics.PREFETCH_WASTED,
+                labelvalues=self._tier_label(tier_idx),
+            )
+        self._prefetched.clear()
+        self._late_prefetches.clear()
 
         # Deferred promotion submissions reserve primary slots that the
         # reset below invalidates; their submit_load() has not yet been
