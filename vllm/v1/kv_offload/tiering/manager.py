@@ -195,6 +195,8 @@ class TieringOffloadingManager(OffloadingManager):
             primary_tier: The primary tier manager (CPU-based).
             secondary_tiers: List of secondary tier managers (e.g., Storage,
                             Network). Can be None or empty list.
+            admission_prefetch_chunks: Maximum chunks to prefetch when an
+                            admitted request opts in.
             prefetch_track_capacity: Max keys tracked for prefetch outcome
                             metrics. 0 disables outcome tracking, counting
                             every promotion as PREFETCH_UNTRACKED.
@@ -252,6 +254,10 @@ class TieringOffloadingManager(OffloadingManager):
         # Buffers manager-level observations (e.g. lookup delay) between
         # get_stats() calls; merged in and reset each time get_stats() runs.
         self._stats = OffloadingConnectorStats()
+
+    @property
+    def admission_prefetch_chunks(self) -> int:
+        return self._admission_prefetch_chunks
 
     def _next_job_id(self) -> JobId:
         """Generate a unique job ID for async transfer tracking."""

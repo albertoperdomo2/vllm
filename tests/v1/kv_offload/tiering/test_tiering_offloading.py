@@ -245,7 +245,7 @@ def test_tiering_manager_accepts_positive_admission_prefetch_chunks():
         admission_prefetch_chunks=100,
     )
 
-    assert manager._admission_prefetch_chunks == 100
+    assert manager.admission_prefetch_chunks == 100
 
 
 @pytest.mark.parametrize("value", [-1, -100])

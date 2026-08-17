@@ -44,6 +44,7 @@ from vllm.v1.kv_offload.base import (
     get_offload_block_hash,
     make_offload_key,
 )
+from vllm.v1.kv_offload.tiering.manager import TieringOffloadingManager
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
@@ -1099,14 +1100,16 @@ def _make_admission_scheduler(
     *,
     admission_prefetch_chunks: int = 100,
     group_configs: tuple[GroupOffloadConfig, ...] | None = None,
+    manager: OffloadingManager | None = None,
 ) -> OffloadingConnectorScheduler:
     if group_configs is None:
         group_configs = (_make_admission_group_config(),)
 
-    manager = MagicMock()
-    manager.admission_prefetch_chunks = admission_prefetch_chunks
-    manager.prefetch_assume_resident = MagicMock()
-    manager.on_new_request.return_value = RequestOffloadingContext()
+    if manager is None:
+        manager = MagicMock()
+        manager.admission_prefetch_chunks = admission_prefetch_chunks
+        manager.prefetch_assume_resident = MagicMock()
+        manager.on_new_request.return_value = RequestOffloadingContext()
 
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler.manager = manager
@@ -1151,6 +1154,28 @@ def _make_admission_request(
 
 
 class TestAdmissionPrefetch:
+    def test_real_tiering_manager_exposes_configured_chunk_limit(self):
+        secondary_tier = MagicMock()
+        secondary_tier.on_new_request.return_value = RequestOffloadingContext()
+        manager = TieringOffloadingManager(
+            primary_tier=MagicMock(),
+            secondary_tiers=[secondary_tier],
+            admission_prefetch_chunks=100,
+        )
+        manager.prefetch_assume_resident = MagicMock()
+        scheduler = _make_admission_scheduler(manager=manager)
+        request = _make_admission_request(
+            125,
+            kv_transfer_params={"abc_admission_prefetch": True},
+        )
+
+        scheduler.on_new_request(request)
+
+        keys = manager.prefetch_assume_resident.call_args.args[0]
+        assert keys == [
+            make_offload_key(block_hash, 0) for block_hash in request.block_hashes[:100]
+        ]
+
     def test_marked_request_passes_first_one_hundred_ordered_keys(self):
         scheduler = _make_admission_scheduler(admission_prefetch_chunks=100)
         request = _make_admission_request(
