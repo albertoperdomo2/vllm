@@ -55,10 +55,12 @@ from vllm.v1.kv_offload.tiering.base import (
     TieringOffloadingMetrics,
 )
 from vllm.v1.kv_offload.tiering.prefetch.base import (
+    AdmissionPrefetchMetrics,
     AdmissionSubmitResult,
     PrefetchPolicy,
 )
 from vllm.v1.kv_offload.tiering.prefetch.config import PrefetchConfig
+from vllm.v1.kv_offload.tiering.prefetch.estimators import TransferCostModel
 from vllm.v1.kv_offload.tiering.prefetch.factory import PrefetchPolicyFactory
 
 logger = init_logger(__name__)
@@ -216,6 +218,11 @@ class TieringOffloadingManager(OffloadingManager):
         self._admission_prefetch_chunks = admission_prefetch_chunks
         self._prefetch_track_capacity = prefetch_track_capacity
         self._late_prefetches: set[OffloadKey] = set()
+        # Promotion timing per tier, fitted from every completed promotion --
+        # demand-driven ones included, so the cost model is calibrated even
+        # when prefetch is in shadow mode and has moved nothing itself.
+        self._promotion_timings: list[TransferCostModel] = []
+        self._promotions_started: dict[JobId, tuple[int, int, float]] = {}
         self._inflight_prefetches: dict[OffloadKey, int] = {}
         self._pending_untracked_prefetches: dict[OffloadKey, int] = {}
         self._demanded_prefetches: set[OffloadKey] = set()
@@ -242,6 +249,9 @@ class TieringOffloadingManager(OffloadingManager):
             policy_cls = PrefetchPolicyFactory.get_prefetch_policy_cls(
                 prefetch_config.policy, prefetch_config.policy_module_path
             )
+            self._promotion_timings = [
+                TransferCostModel(prefetch_config) for _ in self.secondary_tiers
+            ]
             self._prefetch_policy = policy_cls(prefetch_config, self)
 
         # Proactively promoted keys awaiting a demand lookup, oldest
@@ -331,6 +341,13 @@ class TieringOffloadingManager(OffloadingManager):
                 )
 
                 prefetch_job = self._prefetch_job_keys.pop(job_id, None)
+
+                started = self._promotions_started.pop(job_id, None)
+                if started is not None and completed_job.success:
+                    timing_tier_idx, batch_size, started_at = started
+                    self._promotion_timings[timing_tier_idx].observe(
+                        batch_size, (time.monotonic() - started_at) * 1000.0
+                    )
 
                 if job_metadata.is_promotion:
                     # secondary→primary transfer (promotion) completed.
@@ -460,6 +477,9 @@ class TieringOffloadingManager(OffloadingManager):
 
     def prefetch_tier_label(self, tier_idx: int) -> tuple[str]:
         return self._tier_label(tier_idx)
+
+    def prefetch_transfer_cost_ms(self, tier_idx: int, n_chunks: int) -> float:
+        return self._promotion_timings[tier_idx].predict_ms(n_chunks)
 
     def prefetch_tier_allowed(self, tier_idx: int, req_context: ReqContext) -> bool:
         tier = self.secondary_tiers[tier_idx]
@@ -745,6 +765,12 @@ class TieringOffloadingManager(OffloadingManager):
             # rather than retrying indefinitely.
             return False
 
+        if not primary_write_result.keys_to_store:
+            # No slot was allocated, so no transfer job will ever carry this
+            # key. Reporting success would leave a prefetch caller waiting on
+            # a completion that cannot arrive.
+            return False
+
         store_spec = primary_write_result.store_spec
         assert isinstance(store_spec, CPULoadStoreSpec)
         # Defer submit_load to on_schedule_end(). Group by (tier, request) so
@@ -790,6 +816,13 @@ class TieringOffloadingManager(OffloadingManager):
                     self._prefetch_job_keys[job_id] = (
                         tier_idx,
                         tuple(entry.prefetch_keys),
+                    )
+
+                if self._promotion_timings:
+                    self._promotions_started[job_id] = (
+                        self.secondary_tiers.index(tier),
+                        len(entry.keys),
+                        time.monotonic(),
                     )
 
                 tier.submit_load(job_metadata)
@@ -1046,10 +1079,12 @@ class TieringOffloadingManager(OffloadingManager):
         exclude_tier: SecondaryTierManager | None = None,
     ) -> None:
         self.primary_tier.on_request_finished(req_context)
-        if self._prefetch_policy is not None:
+        if self._prefetch_policy is not None and exclude_tier is None:
             # Cancel immediately rather than waiting for tier finalization:
             # the policy must stop issuing lookups before the tier's async
-            # lookup state is cleaned up.
+            # lookup state is cleaned up. Tier-originated finishes are excluded
+            # for the same reason as in on_new_request: they carry a tier's own
+            # serve context, not a scheduler request.
             self._prefetch_policy.on_request_finished(req_context.req_id)
         state = self._req_state[req_context.req_id]
         state.is_finished = True
@@ -1228,6 +1263,22 @@ class TieringOffloadingManager(OffloadingManager):
                 stats = tier_stats
             else:
                 stats.aggregate(tier_stats)
+
+        for tier_idx, timing in enumerate(self._promotion_timings):
+            measured = timing.measured()
+            if measured is None:
+                continue
+            base_ms, per_chunk_ms = measured
+            self._stats.set_gauge(
+                AdmissionPrefetchMetrics.TRANSFER_COST_BASE,
+                base_ms / 1000.0,
+                labelvalues=self._tier_label(tier_idx),
+            )
+            self._stats.set_gauge(
+                AdmissionPrefetchMetrics.TRANSFER_COST_PER_CHUNK,
+                per_chunk_ms / 1000.0,
+                labelvalues=self._tier_label(tier_idx),
+            )
 
         if self._prefetch_policy is not None:
             policy_stats = self._prefetch_policy.get_stats()

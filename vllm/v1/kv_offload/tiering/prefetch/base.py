@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from vllm.v1.kv_offload.base import (
     LookupResult,
     OffloadingCounterMetadata,
+    OffloadingGaugeMetadata,
     OffloadingHistogramMetadata,
     OffloadingMetricMetadata,
     OffloadKey,
@@ -42,6 +43,14 @@ class AdmissionPrefetchMetrics:
     CANCELLED = "vllm:kv_offload_tiering_prefetch_admission_cancelled"
     BUNDLE_OUTCOMES = "vllm:kv_offload_tiering_prefetch_admission_bundle_outcomes"
     TRANSITIONS = "vllm:kv_offload_tiering_prefetch_admission_transitions"
+    BUNDLE_SIZE = "vllm:kv_offload_tiering_prefetch_admission_bundle_chunks"
+    DEADLINE_MARGIN = (
+        "vllm:kv_offload_tiering_prefetch_admission_deadline_margin_seconds"
+    )
+    TRANSFER_COST_BASE = "vllm:kv_offload_tiering_prefetch_transfer_cost_base_seconds"
+    TRANSFER_COST_PER_CHUNK = (
+        "vllm:kv_offload_tiering_prefetch_transfer_cost_per_chunk_seconds"
+    )
     LEAD_TIME = "vllm:kv_offload_tiering_prefetch_admission_lead_time_seconds"
     ACTUAL_LEAD_TIME = (
         "vllm:kv_offload_tiering_prefetch_admission_actual_lead_time_seconds"
@@ -94,9 +103,7 @@ def build_admission_prefetch_metric_definitions(
         AdmissionPrefetchMetrics.SECONDARY_ABSENT: (
             "keys resolved absent from the secondary tier"
         ),
-        AdmissionPrefetchMetrics.GATE_REJECT: (
-            "keys rejected by the deadline or utility gate"
-        ),
+        AdmissionPrefetchMetrics.GATE_REJECT: ("keys rejected by the deadline gate"),
         AdmissionPrefetchMetrics.CAPACITY_SKIP: (
             "keys skipped for capacity or budget reasons"
         ),
@@ -139,6 +146,50 @@ def build_admission_prefetch_metric_definitions(
             buckets=_LEAD_TIME_BUCKETS,
         )
     )
+    definitions[AdmissionPrefetchMetrics.BUNDLE_SIZE] = OffloadingHistogramMetadata(
+        documentation=(
+            "Admission prefetch: contiguous resident prefix length at gate time, "
+            "in chunks"
+        ),
+        buckets=(1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024),
+    )
+    definitions[AdmissionPrefetchMetrics.DEADLINE_MARGIN] = OffloadingHistogramMetadata(
+        documentation=(
+            "Admission prefetch: remaining lead time minus predicted transfer "
+            "time at gate time. Negative means the deadline gate rejected the "
+            "bundle; the distribution shows whether lead time is the binding "
+            "constraint or a comfortable margin."
+        ),
+        buckets=(
+            -10.0,
+            -1.0,
+            -0.1,
+            -0.01,
+            0.0,
+            0.01,
+            0.1,
+            1.0,
+            10.0,
+            60.0,
+        ),
+    )
+    definitions[AdmissionPrefetchMetrics.TRANSFER_COST_BASE] = OffloadingGaugeMetadata(
+        documentation=(
+            "Admission prefetch: measured fixed cost per promotion job. Reported "
+            "only once enough real transfers have been observed to fit it."
+        ),
+        labelnames=("tier",),
+    )
+    definitions[AdmissionPrefetchMetrics.TRANSFER_COST_PER_CHUNK] = (
+        OffloadingGaugeMetadata(
+            documentation=(
+                "Admission prefetch: measured marginal cost per promoted chunk. "
+                "This is what the deadline gate spends; a rising value means the "
+                "tier is contended."
+            ),
+            labelnames=("tier",),
+        )
+    )
     return definitions
 
 
@@ -168,6 +219,10 @@ class PrefetchHost(Protocol):
     def prefetch_tier_allowed(self, tier_idx: int, req_context: ReqContext) -> bool: ...
 
     def prefetch_tier_label(self, tier_idx: int) -> tuple[str]: ...
+
+    def prefetch_transfer_cost_ms(self, tier_idx: int, n_chunks: int) -> float:
+        """Measured promotion cost for a batch of n_chunks on this tier."""
+        ...
 
     def prefetch_submit(
         self, tier_idx: int, keys: Sequence[OffloadKey], req_context: ReqContext

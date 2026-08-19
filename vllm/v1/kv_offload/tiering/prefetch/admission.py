@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
+import operator
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
@@ -19,13 +20,11 @@ from vllm.v1.kv_offload.tiering.prefetch.base import (
     PrefetchPolicy,
 )
 from vllm.v1.kv_offload.tiering.prefetch.config import PrefetchConfig
-from vllm.v1.kv_offload.tiering.prefetch.estimators import (
-    LeadTimeEstimator,
-    transfer_time_ms,
-    utility_ms,
-)
+from vllm.v1.kv_offload.tiering.prefetch.estimators import LeadTimeEstimator
 
 logger = init_logger(__name__)
+
+_bundle_deadline = operator.attrgetter("deadline")
 
 
 class BundleState(enum.Enum):
@@ -78,6 +77,12 @@ class Bundle:
     outstanding: set[OffloadKey] = field(default_factory=set)
     any_load_failed: bool = False
     demanded_while_pending: bool = False
+    # Absolute demand deadline, fixed at admission. Stored rather than derived
+    # so the per-step ordering is a plain attribute read.
+    deadline: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.deadline = self.admitted_at + self.lead_time_ms / 1000.0
 
 
 @dataclass
@@ -290,11 +295,19 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
             if bundle is not None and bundle.state is not BundleState.SUBMITTED:
                 self._cancel(bundle, "cancelled_preempted")
 
+        # Earliest deadline first. Admission order would hand the budget to the
+        # requests closest to being scheduled -- the ones with the least lead
+        # time and so the least to gain -- and make the bundles that can still
+        # be hidden wait behind them.
+        drivable = [
+            bundle
+            for bundle in (self._bundles.get(req_id) for req_id in self._active)
+            if bundle is not None and bundle.state is not BundleState.SUBMITTED
+        ]
+        drivable.sort(key=_bundle_deadline)
+
         step_key_budget = self.config.max_promotions_per_step
-        for req_id in list(self._active):
-            bundle = self._bundles.get(req_id)
-            if bundle is None or bundle.state is BundleState.SUBMITTED:
-                continue
+        for bundle in drivable:
             step_key_budget = self._drive_bundle(bundle, now, step_key_budget)
 
     def _drive_bundle(self, bundle: Bundle, now: float, key_budget: int) -> int:
@@ -314,7 +327,7 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
 
         # Deadline is checked before the gate with one clock snapshot per
         # step, so resolving and expiring in the same step is always LATE.
-        h_remaining_ms = bundle.lead_time_ms - (now - bundle.admitted_at) * 1000.0
+        h_remaining_ms = (bundle.deadline - now) * 1000.0
         if h_remaining_ms <= 0:
             self._late(bundle)
             return key_budget
@@ -331,47 +344,68 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
         if bundle.state is BundleState.PENDING_LOOKUP:
             self._set_state(bundle, BundleState.RESIDENT)
 
-        cap = min(bundle.resolved_run, key_budget)
+        # Hard caps are limits no later step can relax, so anything above them
+        # is genuinely unpromotable and terminalizes here.
+        hard_cap = self.config.max_promotions_per_step
         if self.config.speculative_max_bytes > 0 and self.config.chunk_bytes > 0:
-            available_bytes = max(
-                0,
-                self.config.speculative_max_bytes - self._inflight_speculative_bytes,
+            hard_cap = min(
+                hard_cap,
+                self.config.speculative_max_bytes // self.config.chunk_bytes,
             )
-            cap = min(cap, available_bytes // self.config.chunk_bytes)
-
-        # A fully resolved residency verdict is consumed in this step. Keeping
-        # it across steps would turn a mutable-tier snapshot into a stale fact.
-        if bundle.resolved_run > cap:
+        if bundle.resolved_run > hard_cap:
             self._finalize_keys(
                 AdmissionPrefetchMetrics.CAPACITY_SKIP,
-                bundle.resolved_run - cap,
+                bundle.resolved_run - hard_cap,
             )
-            del bundle.keys[cap:]
-            bundle.resolved_run = cap
+            del bundle.keys[hard_cap:]
+            bundle.resolved_run = hard_cap
 
         if bundle.resolved_run == 0:
             self._bundle_outcome("capacity_skip")
             self._set_state(bundle, BundleState.CAPACITY_SKIPPED)
             return key_budget
 
+        # Contention is different: the shortfall is only what earlier bundles
+        # already spent this step, and the next step restores it. Defer rather
+        # than spending the request's one chance on step-arrival order. The
+        # deadline keeps running, so a bundle that never fits resolves as LATE.
+        available_now = key_budget
+        if self.config.speculative_max_bytes > 0 and self.config.chunk_bytes > 0:
+            free_bytes = max(
+                0,
+                self.config.speculative_max_bytes - self._inflight_speculative_bytes,
+            )
+            available_now = min(available_now, free_bytes // self.config.chunk_bytes)
+        if bundle.resolved_run > available_now:
+            return key_budget
+
         bundle_len = bundle.resolved_run
-        prefetch_latency_ms = transfer_time_ms(self.config, bundle_len)
+        # Cost is measured from real promotions on this tier, so a busy tier
+        # reports longer transfers and the deadline tightens on its own. That
+        # feedback is what protects the active workload; there is no separate
+        # utility term until a contention cost exists that is worth measuring.
+        prefetch_latency_ms = self.host.prefetch_transfer_cost_ms(
+            bundle.tier_idx, bundle_len
+        )
+        # Emitted for accepted and rejected bundles alike: the margin
+        # distribution is what shows whether lead time is the binding
+        # constraint or there is room to spare.
+        self._stats.observe_histogram(AdmissionPrefetchMetrics.BUNDLE_SIZE, bundle_len)
+        self._stats.observe_histogram(
+            AdmissionPrefetchMetrics.DEADLINE_MARGIN,
+            (h_remaining_ms - prefetch_latency_ms) / 1000.0,
+        )
         if h_remaining_ms <= prefetch_latency_ms:
             self._gate_reject(bundle, "gate_reject_deadline")
-            return key_budget
-        expected_utility_ms = utility_ms(self.config, bundle_len)
-        if expected_utility_ms <= 0:
-            self._gate_reject(bundle, "gate_reject_utility")
             return key_budget
 
         logger.debug(
             "admission prefetch decision: req_id=%s bundle_len=%d "
-            "H_remaining_ms=%.3f L_prefetch_ms=%.3f U_ms=%.3f shadow=%s",
+            "H_remaining_ms=%.3f L_prefetch_ms=%.3f shadow=%s",
             bundle.req_id,
             bundle_len,
             h_remaining_ms,
             prefetch_latency_ms,
-            expected_utility_ms,
             self.config.shadow_mode,
         )
 

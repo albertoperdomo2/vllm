@@ -27,21 +27,19 @@ class PrefetchConfig:
     speculative_max_bytes: int = 0
     # Derived by TieringOffloadingSpec; not accepted from user config.
     chunk_bytes: int = 0
-    # Lead-time estimator constants (UNCALIBRATED).
-    initial_admission_interval_ms: float = 50.0
+    # Seed for the lead-time EWMA, replaced by observation within a few
+    # scheduler steps. Default derived from Llama-3.1-Nemotron-Ultra-253B-FP8
+    # at TP8/C64: 0.676 req/s is ~1.48 s per first-schedule event.
+    initial_admission_interval_ms: float = 1450.0
     admission_interval_ewma_alpha: float = 0.2
-    # L_prefetch(B) = transfer_base_ms + transfer_per_chunk_ms * |B|
-    # (UNCALIBRATED).
-    transfer_base_ms: float = 5.0
-    transfer_per_chunk_ms: float = 2.0
-    # U(B) = p_use * demand_load_per_chunk_ms * |B|
-    #        - delta_q_active_ms - c_failure_ms
-    # E[C_eviction] is zero by construction: allocation never evicts and
-    # later demand reclaims speculative capacity before ordinary victims.
-    p_use: float = 0.9
-    demand_load_per_chunk_ms: float = 2.0
-    delta_q_active_ms: float = 0.0
-    c_failure_ms: float = 0.0
+    # Seeds for the measured transfer-cost model, used only until enough
+    # real promotions have been observed. Defaults derived from the same
+    # deployment: a 16-token chunk is 2 MiB at 128 KiB/token aggregate, and
+    # local NVMe read averaged 921 MiB/s while active, so ~2.2 ms per chunk.
+    # These are starting points, not a calibration -- the model refits from
+    # whatever the deployment actually does.
+    transfer_base_ms: float = 0.5
+    transfer_per_chunk_ms: float = 2.2
 
     _BOOL_FIELDS = frozenset({"enabled", "shadow_mode"})
     _POSITIVE_INT_FIELDS = frozenset(
@@ -54,10 +52,6 @@ class PrefetchConfig:
             "admission_interval_ewma_alpha",
             "transfer_base_ms",
             "transfer_per_chunk_ms",
-            "p_use",
-            "demand_load_per_chunk_ms",
-            "delta_q_active_ms",
-            "c_failure_ms",
         }
     )
 
@@ -115,8 +109,5 @@ class PrefetchConfig:
         alpha = kwargs.get("admission_interval_ewma_alpha", 0.2)
         if not 0 < alpha <= 1:
             raise ValueError("prefetch.admission_interval_ewma_alpha must be in (0, 1]")
-        p_use = kwargs.get("p_use", 0.9)
-        if p_use > 1:
-            raise ValueError("prefetch.p_use must be in [0, 1]")
 
         return cls(**kwargs)

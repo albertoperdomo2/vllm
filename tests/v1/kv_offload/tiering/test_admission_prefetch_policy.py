@@ -26,7 +26,10 @@ from vllm.v1.kv_offload.tiering.prefetch.base import (
     AdmissionSubmitResult,
 )
 from vllm.v1.kv_offload.tiering.prefetch.config import PrefetchConfig
-from vllm.v1.kv_offload.tiering.prefetch.estimators import LeadTimeEstimator
+from vllm.v1.kv_offload.tiering.prefetch.estimators import (
+    LeadTimeEstimator,
+    TransferCostModel,
+)
 
 TIER_LABEL = ("1:example",)
 
@@ -59,6 +62,10 @@ class FakeHost:
         # Keys the next submit should report as redundant/capacity-skipped.
         self.submit_redundant = set()
         self.submit_capacity_skipped = set()
+        # Transfer cost the host reports; the manager measures this from real
+        # promotions, so tests set it directly.
+        self.transfer_base_ms = 0.5
+        self.transfer_per_chunk_ms = 2.2
 
     def prefetch_primary_lookup(self, key, req_context):
         self.primary_lookups.append(key)
@@ -73,6 +80,9 @@ class FakeHost:
 
     def prefetch_tier_label(self, tier_idx):
         return TIER_LABEL
+
+    def prefetch_transfer_cost_ms(self, tier_idx, n_chunks):
+        return self.transfer_base_ms + self.transfer_per_chunk_ms * n_chunks
 
     def prefetch_submit(self, tier_idx, keys, req_context):
         keys = list(keys)
@@ -383,10 +393,8 @@ class TestDeadlineGates:
         assert_partition(policy)
 
     def test_gate_rejects_when_transfer_exceeds_lead_time(self):
-        policy, host, _ = make_policy(
-            initial_admission_interval_ms=1.0,
-            transfer_base_ms=1000.0,
-        )
+        policy, host, _ = make_policy(initial_admission_interval_ms=1.0)
+        host.transfer_base_ms = 1000.0
         keys = to_keys(2)
         # H = 1ms of lead time cannot hide a 1000ms transfer.
         admit(policy, host, "r0", keys, queue_ahead=1)
@@ -397,17 +405,23 @@ class TestDeadlineGates:
         assert counter(policy, AdmissionPrefetchMetrics.GATE_REJECT) == 2
         assert_partition(policy)
 
-    def test_gate_rejects_on_non_positive_utility(self):
-        policy, host, _ = make_policy(
-            demand_load_per_chunk_ms=1.0,
-            c_failure_ms=1000.0,
-        )
-        keys = to_keys(2)
-        admit(policy, host, "r0", keys)
-        resolve_all(host, keys, LookupResult.HIT)
+    def test_rising_measured_cost_tightens_the_gate(self):
+        """A busy tier reports slower transfers, so the gate closes itself."""
+        policy, host, _ = make_policy(initial_admission_interval_ms=10.0)
+        keys_fast = to_keys(2, prefix="fast")
+        resolve_all(host, keys_fast, LookupResult.HIT)
+        admit(policy, host, "fast", keys_fast, queue_ahead=1)
+        policy.step(empty_step())
+        assert host.submits == [keys_fast]
+
+        # Same lead time, but the tier is now measurably slower.
+        host.transfer_per_chunk_ms = 500.0
+        keys_slow = to_keys(2, prefix="slow")
+        resolve_all(host, keys_slow, LookupResult.HIT)
+        admit(policy, host, "slow", keys_slow, queue_ahead=1)
         policy.step(empty_step())
 
-        assert host.submits == []
+        assert host.submits == [keys_fast]
         assert counter(policy, AdmissionPrefetchMetrics.GATE_REJECT) == 2
         assert_partition(policy)
 
@@ -546,7 +560,7 @@ class TestCapacityAndBudget:
         assert counter(policy, AdmissionPrefetchMetrics.CAPACITY_SKIP) == 3
         assert_partition(policy)
 
-    def test_budget_exhaustion_capacity_skips_second_bundle(self):
+    def test_budget_exhaustion_defers_second_bundle_to_next_step(self):
         policy, host, _ = make_policy(max_promotions_per_step=2)
         keys_a = to_keys(2, prefix="a")
         keys_b = to_keys(2, prefix="b")
@@ -555,28 +569,79 @@ class TestCapacityAndBudget:
         admit(policy, host, "r1", keys_b)
         policy.step(empty_step())
 
-        # A resolved residency snapshot is never carried to a later step.
+        # Step contention is temporary, so the second bundle keeps its chance
+        # instead of losing it to whichever request resolved first.
         assert host.submits == [keys_a]
-        assert "r1" not in policy._bundles
-        assert counter(policy, AdmissionPrefetchMetrics.CAPACITY_SKIP) == 2
+        assert policy._bundles["r1"].state is BundleState.RESIDENT
+        assert counter(policy, AdmissionPrefetchMetrics.CAPACITY_SKIP) == 0
+
         policy.step(empty_step())
-        assert host.submits == [keys_a]
+        assert host.submits == [keys_a, keys_b]
         assert_partition(policy)
 
-    def test_speculative_byte_budget_capacity_skips_submission(self):
-        policy, host, _ = make_policy(speculative_max_bytes=100, chunk_bytes=60)
-        keys_a = to_keys(1, prefix="a")
-        keys_b = to_keys(1, prefix="b")
-        resolve_all(host, keys_a + keys_b, LookupResult.HIT)
-        admit(policy, host, "r0", keys_a)
-        admit(policy, host, "r1", keys_b)
+    def test_bundle_larger_than_whole_budget_is_capped_not_deferred(self):
+        # No later step could fit this either, so the excess is terminal.
+        policy, host, _ = make_policy(max_promotions_per_step=2)
+        keys = to_keys(5)
+        resolve_all(host, keys, LookupResult.HIT)
+        admit(policy, host, "r0", keys)
         policy.step(empty_step())
 
-        assert host.submits == [keys_a]
-        assert counter(policy, AdmissionPrefetchMetrics.CAPACITY_SKIP) == 1
+        assert host.submits == [keys[:2]]
+        assert counter(policy, AdmissionPrefetchMetrics.CAPACITY_SKIP) == 3
+        assert_partition(policy)
+
+    def test_speculative_byte_budget_defers_then_submits(self):
+        policy, host, _ = make_policy(speculative_max_bytes=120, chunk_bytes=60)
+        keys_a = to_keys(1, prefix="a")
+        keys_b = to_keys(1, prefix="b")
+        keys_c = to_keys(1, prefix="c")
+        resolve_all(host, keys_a + keys_b + keys_c, LookupResult.HIT)
+        admit(policy, host, "r0", keys_a)
+        admit(policy, host, "r1", keys_b)
+        admit(policy, host, "r2", keys_c)
+        policy.step(empty_step())
+
+        # Two chunks fit the byte budget; the third waits for one to land.
+        assert host.submits == [keys_a, keys_b]
+        assert counter(policy, AdmissionPrefetchMetrics.CAPACITY_SKIP) == 0
+
         policy.on_promotion_finished(keys_a, success=True)
         policy.step(empty_step())
-        assert host.submits == [keys_a]
+        assert host.submits == [keys_a, keys_b, keys_c]
+        assert_partition(policy)
+
+    def test_earliest_deadline_wins_the_step_budget(self):
+        policy, host, _ = make_policy(
+            max_promotions_per_step=2, initial_admission_interval_ms=100.0
+        )
+        slack = to_keys(2, prefix="slack")
+        urgent = to_keys(2, prefix="urgent")
+
+        # Admitted first, behind a deep queue, so it has the most lead time.
+        admit(policy, host, "slack", slack, queue_ahead=20)
+        # Drain that queue so the next admission sees a shallow one and is
+        # therefore closer to its own demand.
+        policy.step(
+            ScheduleEndContext(
+                new_req_ids=tuple(f"slack-ahead{i}" for i in range(20)),
+                preempted_req_ids=(),
+            )
+        )
+        admit(policy, host, "urgent", urgent, queue_ahead=0)
+        assert (
+            policy._bundles["urgent"].lead_time_ms
+            < policy._bundles["slack"].lead_time_ms
+        )
+
+        resolve_all(host, slack + urgent, LookupResult.HIT)
+        policy.step(empty_step())
+
+        # Admission order would have served slack first. The bundle closest to
+        # its demand wins the budget; the one that can still be hidden defers.
+        assert host.submits == [urgent]
+        policy.step(empty_step())
+        assert host.submits == [urgent, slack]
         assert_partition(policy)
 
     def test_pending_bundle_overflow_accounts_candidate_keys(self):
@@ -720,3 +785,54 @@ class TestPartitionInvariant:
         policy.reset()
         assert not policy.has_pending_work()
         assert_partition(policy)
+
+
+class TestTransferCostModel:
+    def test_uses_seeds_until_enough_samples(self):
+        model = TransferCostModel(
+            PrefetchConfig(transfer_base_ms=1.0, transfer_per_chunk_ms=3.0)
+        )
+        assert model.measured() is None
+        assert model.predict_ms(10) == pytest.approx(31.0)
+
+    def test_fits_base_and_slope_from_observations(self):
+        model = TransferCostModel(PrefetchConfig())
+        # Ground truth: 4ms fixed + 1.5ms per chunk.
+        for _ in range(15):
+            for n in (1, 4, 16):
+                model.observe(n, 4.0 + 1.5 * n)
+
+        fit = model.measured()
+        assert fit is not None
+        base, per_chunk = fit
+        assert base == pytest.approx(4.0, abs=0.2)
+        assert per_chunk == pytest.approx(1.5, abs=0.05)
+        assert model.predict_ms(8) == pytest.approx(16.0, abs=0.3)
+
+    def test_uniform_batch_size_is_not_identifiable(self):
+        # Slope and intercept cannot be separated without spread, so the
+        # model must keep reporting seeds rather than invent a fit.
+        model = TransferCostModel(PrefetchConfig())
+        for _ in range(100):
+            model.observe(8, 20.0)
+        assert model.measured() is None
+
+    def test_tracks_a_tier_that_gets_slower(self):
+        model = TransferCostModel(PrefetchConfig())
+        for _ in range(200):
+            for n in (1, 8):
+                model.observe(n, 1.0 * n)
+        fast = model.predict_ms(8)
+        assert fast == pytest.approx(8.0, abs=0.5)
+
+        for _ in range(400):
+            for n in (1, 8):
+                model.observe(n, 10.0 * n)
+        assert model.predict_ms(8) > fast * 3
+
+    def test_ignores_degenerate_samples(self):
+        model = TransferCostModel(PrefetchConfig())
+        model.observe(0, 5.0)
+        model.observe(-1, 5.0)
+        model.observe(4, -1.0)
+        assert model.measured() is None
