@@ -137,7 +137,6 @@ class Harness:
         for i in range(queue_ahead):
             filler = ReqContext(req_id=f"{req_id}-ahead{i}", kv_transfer_params=None)
             self.manager.on_new_request(filler)
-            self.manager.prefetch_on_admission([], filler)
         ctx = ReqContext(req_id=req_id, kv_transfer_params=None)
         self.manager.on_new_request(ctx)
         self.manager.prefetch_on_admission(keys, ctx)
@@ -156,6 +155,12 @@ class Harness:
 
     def manager_counter(self, name, labelvalues=("1:stub",)):
         return self.manager._stats._values.get(name, {}).get(labelvalues, 0)
+
+    def bundle_outcome(self, outcome):
+        labels = ("1:stub", outcome)
+        return self.policy._stats._values.get(
+            AdmissionPrefetchMetrics.BUNDLE_OUTCOMES, {}
+        ).get(labels, 0)
 
     def assert_partition(self):
         considered = self.counter(AdmissionPrefetchMetrics.CONSIDERED)
@@ -179,6 +184,21 @@ class TestSubmission:
         assert h.manager_counter(TieringOffloadingMetrics.PREFETCH_PROMOTED) == 3
         assert len(h.manager._prefetched) == 3
         h.assert_partition()
+
+    def test_unmarked_requests_contribute_to_marked_queue_position(self):
+        h = Harness(initial_admission_interval_ms=10.0)
+        for i in range(50):
+            h.manager.on_new_request(
+                ReqContext(req_id=f"unmarked-{i}", kv_transfer_params=None)
+            )
+        keys = to_keys([1])
+        h.tier.resolve(keys)
+
+        h.admit("marked", keys, queue_ahead=0)
+
+        assert h.policy._bundles["marked"].lead_time_ms == pytest.approx(500.0)
+        h.step()
+        assert h.counter(AdmissionPrefetchMetrics.SUBMITTED) == 1
 
     def test_submission_allocates_each_key_exactly_once(self, monkeypatch):
         h = Harness()
@@ -248,6 +268,30 @@ class TestNonEviction:
         assert h.counter(AdmissionPrefetchMetrics.CAPACITY_SKIP) == 2
         h.assert_partition()
 
+    def test_demand_reclaims_prefetch_before_older_demand_block(self):
+        h = Harness(num_blocks=2)
+        demand_ctx = ReqContext(req_id="demand", kv_transfer_params=None)
+        h.manager.on_new_request(demand_ctx)
+        old_demand = to_keys([90])
+        initial = h.manager.prepare_store(old_demand, demand_ctx)
+        assert initial is not None
+        h.manager.complete_store(old_demand, demand_ctx)
+        h.step()
+
+        prefetched = to_keys([1])
+        h.tier.resolve(prefetched)
+        h.admit("marked", prefetched)
+        h.step()
+        h.step()
+
+        new_demand = to_keys([91])
+        result = h.manager.prepare_store(new_demand, demand_ctx)
+
+        assert result is not None
+        assert result.evicted_keys == prefetched
+        assert h.primary.lookup(old_demand[0], demand_ctx) is LookupResult.HIT
+        assert h.primary.lookup(prefetched[0], demand_ctx) is LookupResult.MISS
+
     def test_partial_capacity_submits_contiguous_prefix(self):
         h = Harness(num_blocks=3)
         resident = to_keys([90, 91])
@@ -295,6 +339,8 @@ class TestCompletionAndFailure:
         h.step()
 
         assert not h.policy.has_pending_work()
+        assert h.bundle_outcome("ready") == 1
+        assert h.bundle_outcome("submitted") == 0
         h.assert_partition()
 
     def test_failed_promotion_is_load_failed_and_frees_blocks(self):
@@ -311,6 +357,27 @@ class TestCompletionAndFailure:
         assert not h.manager._prefetched
         assert h.primary._get_num_free_blocks() == free_before
         assert not h.policy.has_pending_work()
+        assert h.bundle_outcome("failed") == 1
+        assert h.bundle_outcome("submitted") == 0
+        h.assert_partition()
+
+    def test_demand_reaching_inflight_bundle_terminalizes_late(self):
+        h = Harness()
+        keys = to_keys([1, 2])
+        h.tier.resolve(keys)
+        h.tier.autocomplete = False
+        ctx = h.admit("r0", keys)
+        h.step()
+
+        assert h.manager.lookup(keys[0], ctx) is LookupResult.HIT_PENDING
+        h.tier.complete_pending(success=True)
+        h.step()
+        h.step()
+
+        assert not h.policy.has_pending_work()
+        assert h.bundle_outcome("late") == 1
+        assert h.bundle_outcome("ready") == 0
+        assert h.bundle_outcome("submitted") == 0
         h.assert_partition()
 
     def test_useful_outcome_recorded_on_demand_hit(self):

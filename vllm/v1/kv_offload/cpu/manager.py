@@ -61,6 +61,9 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_evictable_cache_blocks: int = 0
         # Track blocks with an in-flight store (ref_cnt -1, not yet completed).
         self._num_write_pending_blocks: int = 0
+        # Ready blocks populated speculatively. Demand allocations reclaim
+        # these before asking the configured policy to evict demand data.
+        self._speculative: OrderedDict[OffloadKey, None] = OrderedDict()
 
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
@@ -132,6 +135,7 @@ class CPUOffloadingManager(OffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> LoadStoreSpec:
+        self.mark_demanded(keys)
         blocks = []
         for key in keys:
             block = self._policy.get(key)
@@ -147,7 +151,34 @@ class CPUOffloadingManager(OffloadingManager):
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        self.mark_demanded(keys)
         self._policy.touch(keys, req_context)
+
+    def mark_speculative(self, keys: Collection[OffloadKey]) -> None:
+        """Mark ready blocks as reclaimable speculative capacity."""
+        for key in keys:
+            block = self._policy.get(key)
+            if block is not None and block.is_ready:
+                self._speculative[key] = None
+
+    def mark_demanded(self, keys: Collection[OffloadKey]) -> None:
+        """Remove demand-touched blocks from speculative provenance."""
+        for key in keys:
+            self._speculative.pop(key, None)
+
+    def _speculative_eviction_candidates(
+        self, n: int, protected: set[OffloadKey]
+    ) -> list[tuple[OffloadKey, BlockStatus]]:
+        candidates: list[tuple[OffloadKey, BlockStatus]] = []
+        for key in self._speculative:
+            if key in protected:
+                continue
+            block = self._policy.get(key)
+            if block is not None and block.ref_cnt == 0:
+                candidates.append((key, block))
+                if len(candidates) == n:
+                    break
+        return candidates
 
     @override
     def complete_load(
@@ -174,10 +205,11 @@ class CPUOffloadingManager(OffloadingManager):
 
         Args:
             allow_eviction: when False, allocate only from currently free
-                blocks and return None rather than evicting. Speculative
-                callers use this so a prefetch can never displace a block
-                that demand is about to need.
+                blocks and return None rather than evicting. When True,
+                reclaim ready speculative blocks before evicting demand data.
         """
+        if allow_eviction:
+            self.mark_demanded(keys)
         if self.counts is not None:
             num_keys = len(keys)
             keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
@@ -208,9 +240,24 @@ class CPUOffloadingManager(OffloadingManager):
             # Blocks from the original input are excluded from eviction candidates:
             # a block that was already stored must remain in the cache after this call.
             protected = set(keys)
-            evicted = self._policy.evict(num_blocks_to_evict, protected)
-            if evicted is None:
+            speculative = self._speculative_eviction_candidates(
+                num_blocks_to_evict, protected
+            )
+            normal_count = num_blocks_to_evict - len(speculative)
+
+            # Select normal victims atomically before removing speculative
+            # blocks. Protect all speculative provenance so the cache policy
+            # cannot choose a demand block in their place.
+            normal_evicted = self._policy.evict(
+                normal_count, protected | set(self._speculative)
+            )
+            if normal_evicted is None:
                 return None
+
+            for key, _ in speculative:
+                self._policy.remove(key)
+                self._speculative.pop(key, None)
+            evicted = speculative + normal_evicted
 
             # cache-policy removes only idle blocks.
             self._num_evictable_cache_blocks -= len(evicted)
@@ -271,6 +318,7 @@ class CPUOffloadingManager(OffloadingManager):
                 if block is not None and not block.is_ready:
                     self._num_write_pending_blocks -= 1
                     self._policy.remove(key)
+                    self._speculative.pop(key, None)
                     self._free_block(block)
 
         if stored_keys and self.events is not None:
@@ -292,6 +340,7 @@ class CPUOffloadingManager(OffloadingManager):
         self._policy.clear()
         self._num_evictable_cache_blocks = 0
         self._num_write_pending_blocks = 0
+        self._speculative.clear()
 
         self._free_list.clear()
         self._num_allocated_blocks = 0

@@ -18,7 +18,7 @@ Configuration via kv_connector_extra_config:
     registered via CachePolicyFactory
   - prefetch_track_capacity: (optional) max prefetch-promoted keys tracked to
     attribute the useful/wasted outcome counters; 0 disables outcome tracking,
-    in which case every promotion is counted as PREFETCH_UNTRACKED
+    in which case every successful promotion is counted as PREFETCH_UNTRACKED
     (default: 8192)
   - admission_prefetch_chunks: (optional) blind first-N proactive promotion at
     request admission; requires a secondary tier and a per-request
@@ -216,7 +216,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     "determined, because prefetch_track_capacity was exceeded or "
                     "is 0 (tracking disabled), labeled by tier. Not an outcome: "
                     "these chunks may still have been used. Equal to "
-                    "PREFETCH_PROMOTED means tracking is off and the "
+                    "PREFETCH_PROMOTED minus PREFETCH_LOAD_FAILED means tracking "
+                    "is off and the "
                     "useful/wasted ratio has no samples; a smaller non-trivial "
                     "value means it is under-sampled and the capacity should be "
                     "raised."

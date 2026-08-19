@@ -1332,6 +1332,7 @@ class TestPolicyAdmissionPrefetch:
 
         scheduler.on_new_request(request)
 
+        scheduler.manager.on_new_request.assert_called_once()
         scheduler.manager.prefetch_on_admission.assert_not_called()
 
     @pytest.mark.parametrize(

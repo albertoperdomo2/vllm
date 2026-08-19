@@ -29,6 +29,7 @@ from vllm.v1.kv_offload.base import (
     Medium,
     OffloadingCounterMetadata,
     OffloadingEvent,
+    OffloadingHistogramMetadata,
     OffloadKey,
     OffloadPolicy,
     ReqContext,
@@ -123,6 +124,7 @@ def assert_prefetch_accounting(stats: OffloadingConnectorStats, manager) -> None
         + counter_total(stats, TieringOffloadingMetrics.PREFETCH_UNTRACKED)
         + counter_total(stats, TieringOffloadingMetrics.PREFETCH_LOAD_FAILED)
         + len(manager._prefetched)
+        + len(manager._pending_untracked_prefetches)
     )
     assert accounted == promoted
 
@@ -303,6 +305,11 @@ def test_tiering_spec_defines_admission_prefetch_metrics():
         "outcome",
     )
     assert metrics[AdmissionPrefetchMetrics.TRANSITIONS].labelnames == ("transition",)
+    for name in (
+        AdmissionPrefetchMetrics.LEAD_TIME,
+        AdmissionPrefetchMetrics.ACTUAL_LEAD_TIME,
+    ):
+        assert isinstance(metrics[name], OffloadingHistogramMetadata)
 
 
 def test_tiering_spec_defaults_prefetch_config_to_none():
@@ -980,12 +987,32 @@ class TestTieringOffloadingManager:
         assert first not in self.manager._late_prefetches
         assert second in self.manager._prefetched
 
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+
         stats = self.manager.get_stats()
         assert stats is not None
         assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_PROMOTED) == 2
         assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_UNTRACKED) == 1
         assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_WASTED) == 0
         assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_USEFUL) == 0
+        assert_prefetch_accounting(stats, self.manager)
+
+    def test_tracking_overflow_and_load_failure_are_disjoint(self, manager_setup):
+        """A failed overflowed promotion must not also count as untracked."""
+        self._start_request()
+        self.manager._prefetch_track_capacity = 1
+        first, second = to_keys([1, 2])
+
+        assert self.manager.prefetch_assume_resident([first, second], _CTX) == 2
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_PROMOTED) == 2
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_LOAD_FAILED) == 2
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_UNTRACKED) == 0
         assert_prefetch_accounting(stats, self.manager)
 
     def test_repeated_prefetch_resolves_previous_record_as_wasted(self, manager_setup):
@@ -1046,6 +1073,9 @@ class TestTieringOffloadingManager:
         block = to_keys([1])[0]
         self._queue_tracked_promotion(block)
         assert not self.manager._prefetched
+
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
 
         stats = self.manager.get_stats()
         assert stats is not None

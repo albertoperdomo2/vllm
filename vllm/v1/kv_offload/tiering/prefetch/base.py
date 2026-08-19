@@ -43,6 +43,9 @@ class AdmissionPrefetchMetrics:
     BUNDLE_OUTCOMES = "vllm:kv_offload_tiering_prefetch_admission_bundle_outcomes"
     TRANSITIONS = "vllm:kv_offload_tiering_prefetch_admission_transitions"
     LEAD_TIME = "vllm:kv_offload_tiering_prefetch_admission_lead_time_seconds"
+    ACTUAL_LEAD_TIME = (
+        "vllm:kv_offload_tiering_prefetch_admission_actual_lead_time_seconds"
+    )
 
     TERMINAL_COUNTERS = (
         PRIMARY_REDUNDANT,
@@ -128,6 +131,14 @@ def build_admission_prefetch_metric_definitions(
         documentation="Admission prefetch: predicted lead time at admission",
         buckets=_LEAD_TIME_BUCKETS,
     )
+    definitions[AdmissionPrefetchMetrics.ACTUAL_LEAD_TIME] = (
+        OffloadingHistogramMetadata(
+            documentation=(
+                "Admission prefetch: actual admission-to-first-schedule lead time"
+            ),
+            buckets=_LEAD_TIME_BUCKETS,
+        )
+    )
     return definitions
 
 
@@ -166,12 +177,10 @@ class PrefetchHost(Protocol):
 class PrefetchPolicy(ABC):
     """Pluggable proactive prefetch policy for TieringOffloadingManager.
 
-    The manager calls on_request_admitted() when the connector registers a
-    new request, step() once per scheduler step from on_schedule_end()
-    (after finished-job processing, before the promotion flush),
-    on_request_finished() when a request completes,
-    on_promotion_finished() when a submitted promotion job resolves, and
-    reset() from reset_cache() after all in-flight jobs have drained.
+    The manager calls on_request_enqueued() for every local request and
+    on_request_admitted() only when the connector offers an opted-in
+    candidate. It calls step() once per scheduler step from on_schedule_end(),
+    after finished-job processing and before the promotion flush.
     """
 
     def __init__(
@@ -194,6 +203,10 @@ class PrefetchPolicy(ABC):
         self, req_context: ReqContext, offload_keys: Sequence[OffloadKey]
     ) -> None: ...
 
+    def on_request_enqueued(self, req_context: ReqContext) -> None:
+        """Observe every scheduler admission, including non-opted-in requests."""
+        return
+
     @abstractmethod
     def step(self, context: ScheduleEndContext) -> None: ...
 
@@ -204,6 +217,10 @@ class PrefetchPolicy(ABC):
     def on_promotion_finished(
         self, keys: Sequence[OffloadKey], success: bool
     ) -> None: ...
+
+    def on_prefetch_demand(self, key: OffloadKey, primary_result: LookupResult) -> None:
+        """Observe demand reaching a key owned by an in-flight prefetch."""
+        return
 
     @abstractmethod
     def has_pending_work(self) -> bool: ...

@@ -206,7 +206,7 @@ class TieringOffloadingManager(OffloadingManager):
                             admitted request opts in.
             prefetch_track_capacity: Max keys tracked for prefetch outcome
                             metrics. 0 disables outcome tracking, counting
-                            every promotion as PREFETCH_UNTRACKED.
+                            every successful promotion as PREFETCH_UNTRACKED.
             prefetch_config: Configuration for the residency- and
                             deadline-gated prefetch policy. Mutually
                             exclusive with admission_prefetch_chunks.
@@ -216,6 +216,9 @@ class TieringOffloadingManager(OffloadingManager):
         self._admission_prefetch_chunks = admission_prefetch_chunks
         self._prefetch_track_capacity = prefetch_track_capacity
         self._late_prefetches: set[OffloadKey] = set()
+        self._inflight_prefetches: dict[OffloadKey, int] = {}
+        self._pending_untracked_prefetches: dict[OffloadKey, int] = {}
+        self._demanded_prefetches: set[OffloadKey] = set()
 
         if self._admission_prefetch_chunks > 0 and not self.secondary_tiers:
             raise ValueError(
@@ -349,6 +352,25 @@ class TieringOffloadingManager(OffloadingManager):
                             for key in prefetch_keys:
                                 self._prefetched.pop(key, None)
                                 self._late_prefetches.discard(key)
+                        else:
+                            speculative_keys = tuple(
+                                key
+                                for key in prefetch_keys
+                                if key not in self._demanded_prefetches
+                            )
+                            self.primary_tier.mark_speculative(speculative_keys)
+
+                        for key in prefetch_keys:
+                            self._inflight_prefetches.pop(key, None)
+                            untracked_tier_idx = self._pending_untracked_prefetches.pop(
+                                key, None
+                            )
+                            if completed_job.success and untracked_tier_idx is not None:
+                                self._stats.increase_counter(
+                                    TieringOffloadingMetrics.PREFETCH_UNTRACKED,
+                                    labelvalues=self._tier_label(untracked_tier_idx),
+                                )
+                            self._demanded_prefetches.discard(key)
                         if self._prefetch_policy is not None:
                             self._prefetch_policy.on_promotion_finished(
                                 prefetch_keys, completed_job.success
@@ -508,15 +530,11 @@ class TieringOffloadingManager(OffloadingManager):
     def _track_prefetched(self, key: OffloadKey, tier_idx: int) -> None:
         """Record a prefetch-promoted key until a demand lookup resolves it."""
         self._late_prefetches.discard(key)
+        self._inflight_prefetches[key] = tier_idx
         if self._prefetch_track_capacity <= 0:
-            # Tracking disabled: still account for the promotion, so that
-            # useful + wasted + untracked + tracked == promoted holds
-            # unconditionally and dashboards can tell that the success ratio
-            # has no samples rather than reading a silent 0/0.
-            self._stats.increase_counter(
-                TieringOffloadingMetrics.PREFETCH_UNTRACKED,
-                labelvalues=self._tier_label(tier_idx),
-            )
+            # Delay the untracked classification until the transfer succeeds;
+            # a failed promotion belongs only to PREFETCH_LOAD_FAILED.
+            self._pending_untracked_prefetches[key] = tier_idx
             return
 
         previous_tier_idx = self._prefetched.pop(key, None)
@@ -533,13 +551,15 @@ class TieringOffloadingManager(OffloadingManager):
         while len(self._prefetched) > self._prefetch_track_capacity:
             dropped_key, dropped_tier_idx = self._prefetched.popitem(last=False)
             self._late_prefetches.discard(dropped_key)
-            # A bookkeeping limit, not an outcome: the block may well still be
-            # resident and used later. Counting it wasted would make the success
-            # rate a function of tracking capacity and burst size.
-            self._stats.increase_counter(
-                TieringOffloadingMetrics.PREFETCH_UNTRACKED,
-                labelvalues=self._tier_label(dropped_tier_idx),
-            )
+            if dropped_key in self._inflight_prefetches:
+                self._pending_untracked_prefetches[dropped_key] = dropped_tier_idx
+            else:
+                # A bookkeeping limit, not an outcome: the block may well still
+                # be resident and used later.
+                self._stats.increase_counter(
+                    TieringOffloadingMetrics.PREFETCH_UNTRACKED,
+                    labelvalues=self._tier_label(dropped_tier_idx),
+                )
 
     def _observe_prefetch_outcome(
         self, key: OffloadKey, primary_hit: LookupResult
@@ -617,8 +637,14 @@ class TieringOffloadingManager(OffloadingManager):
         req_state = self._req_state.get(req_context.req_id)
 
         primary_hit = self.primary_tier.lookup(key, req_context)
+        if primary_hit in (LookupResult.HIT, LookupResult.HIT_PENDING):
+            self.primary_tier.mark_demanded((key,))
+        if primary_hit is LookupResult.HIT_PENDING and key in self._inflight_prefetches:
+            self._demanded_prefetches.add(key)
         if self._prefetched:
             self._observe_prefetch_outcome(key, primary_hit)
+        if self._prefetch_policy is not None:
+            self._prefetch_policy.on_prefetch_demand(key, primary_hit)
         if primary_hit is LookupResult.HIT:
             return LookupResult.HIT
         if primary_hit is LookupResult.HIT_PENDING:
@@ -862,6 +888,9 @@ class TieringOffloadingManager(OffloadingManager):
         if primary_result is None:
             return None
 
+        for evicted_key in primary_result.evicted_keys:
+            self._observe_prefetch_outcome(evicted_key, LookupResult.MISS)
+
         if primary_result.keys_to_store:
             state = self._req_state[req_context.req_id]
             state.pending_primary_stores += 1
@@ -999,6 +1028,8 @@ class TieringOffloadingManager(OffloadingManager):
                     state.request_level_tiers = set()
                 state.request_level_tiers.add(tier)
         self._req_state[req_context.req_id] = state
+        if self._prefetch_policy is not None and exclude_tier is None:
+            self._prefetch_policy.on_request_enqueued(req_context)
 
         policy = (
             OffloadPolicy.REQUEST_LEVEL
@@ -1146,6 +1177,14 @@ class TieringOffloadingManager(OffloadingManager):
             )
         self._prefetched.clear()
         self._late_prefetches.clear()
+        for tier_idx in self._pending_untracked_prefetches.values():
+            self._stats.increase_counter(
+                TieringOffloadingMetrics.PREFETCH_UNTRACKED,
+                labelvalues=self._tier_label(tier_idx),
+            )
+        self._pending_untracked_prefetches.clear()
+        self._inflight_prefetches.clear()
+        self._demanded_prefetches.clear()
 
         # Safe now: the drain above resolved every submitted bundle through
         # on_promotion_finished(), so only unsubmitted state remains.

@@ -26,6 +26,7 @@ from vllm.v1.kv_offload.tiering.prefetch.base import (
     AdmissionSubmitResult,
 )
 from vllm.v1.kv_offload.tiering.prefetch.config import PrefetchConfig
+from vllm.v1.kv_offload.tiering.prefetch.estimators import LeadTimeEstimator
 
 TIER_LABEL = ("1:example",)
 
@@ -127,12 +128,13 @@ def fill_queue(policy, count, tag="filler"):
     """
     for i in range(count):
         ctx = ReqContext(req_id=f"{tag}{i}", kv_transfer_params=None)
-        policy.on_request_admitted(ctx, [])
+        policy.on_request_enqueued(ctx)
 
 
 def admit(policy, host, req_id, keys, queue_ahead=3):
     fill_queue(policy, queue_ahead, tag=f"{req_id}-ahead")
     ctx = ReqContext(req_id=req_id, kv_transfer_params=None)
+    policy.on_request_enqueued(ctx)
     policy.on_request_admitted(ctx, keys)
     return ctx
 
@@ -287,6 +289,76 @@ class TestDeadlines:
         assert not policy.has_pending_work()
         assert_partition(policy)
 
+
+class TestLeadTimeEstimator:
+    def test_batch_is_one_throughput_sample(self):
+        estimator = LeadTimeEstimator(
+            PrefetchConfig(
+                initial_admission_interval_ms=50.0,
+                admission_interval_ewma_alpha=1.0,
+            )
+        )
+
+        estimator.on_first_scheduled(0.0, 32, queue_remains_nonempty=True)
+        estimator.on_first_scheduled(0.1, 32, queue_remains_nonempty=True)
+
+        assert estimator.predict_ms(32) == pytest.approx(100.0)
+
+    def test_idle_time_does_not_inflate_next_sample(self):
+        estimator = LeadTimeEstimator(
+            PrefetchConfig(
+                initial_admission_interval_ms=50.0,
+                admission_interval_ewma_alpha=1.0,
+            )
+        )
+        estimator.on_first_scheduled(0.0, 32, queue_remains_nonempty=True)
+        estimator.on_first_scheduled(0.1, 32, queue_remains_nonempty=True)
+        estimator.on_queue_idle()
+
+        estimator.on_first_scheduled(3600.0, 1, queue_remains_nonempty=True)
+
+        assert estimator.predict_ms(32) == pytest.approx(100.0)
+
+    def test_reset_restores_initial_interval(self):
+        estimator = LeadTimeEstimator(
+            PrefetchConfig(
+                initial_admission_interval_ms=50.0,
+                admission_interval_ewma_alpha=1.0,
+            )
+        )
+        estimator.on_first_scheduled(0.0, 1, queue_remains_nonempty=True)
+        estimator.on_first_scheduled(1.0, 1, queue_remains_nonempty=True)
+
+        estimator.reset()
+
+        assert estimator.predict_ms(2) == pytest.approx(100.0)
+
+
+class TestQueueObservation:
+    def test_non_candidate_requests_contribute_to_queue_position(self):
+        policy, host, _ = make_policy(initial_admission_interval_ms=10.0)
+        fill_queue(policy, 50)
+        keys = to_keys(1)
+
+        admit(policy, host, "marked", keys, queue_ahead=0)
+
+        assert policy._bundles["marked"].lead_time_ms == pytest.approx(500.0)
+
+    def test_actual_lead_time_is_observed_at_first_schedule(self):
+        policy, host, clock = make_policy()
+        keys = to_keys(1)
+        admit(policy, host, "r0", keys)
+        clock.advance_ms(25.0)
+
+        policy.step(ScheduleEndContext(new_req_ids=("r0",), preempted_req_ids=()))
+
+        observations = policy._stats._values[AdmissionPrefetchMetrics.ACTUAL_LEAD_TIME][
+            ()
+        ]
+        assert observations == pytest.approx([0.025])
+
+
+class TestDeadlineGates:
     def test_resolution_and_expiry_same_step_is_late(self):
         policy, host, clock = make_policy(initial_admission_interval_ms=100.0)
         keys = to_keys(2)
@@ -474,7 +546,7 @@ class TestCapacityAndBudget:
         assert counter(policy, AdmissionPrefetchMetrics.CAPACITY_SKIP) == 3
         assert_partition(policy)
 
-    def test_budget_exhaustion_defers_second_bundle(self):
+    def test_budget_exhaustion_capacity_skips_second_bundle(self):
         policy, host, _ = make_policy(max_promotions_per_step=2)
         keys_a = to_keys(2, prefix="a")
         keys_b = to_keys(2, prefix="b")
@@ -483,15 +555,15 @@ class TestCapacityAndBudget:
         admit(policy, host, "r1", keys_b)
         policy.step(empty_step())
 
-        # First bundle consumes the budget; the second defers rather than
-        # being rejected, and lands on the next step.
+        # A resolved residency snapshot is never carried to a later step.
         assert host.submits == [keys_a]
-        assert policy._bundles["r1"].state is BundleState.RESIDENT
+        assert "r1" not in policy._bundles
+        assert counter(policy, AdmissionPrefetchMetrics.CAPACITY_SKIP) == 2
         policy.step(empty_step())
-        assert host.submits == [keys_a, keys_b]
+        assert host.submits == [keys_a]
         assert_partition(policy)
 
-    def test_speculative_byte_budget_defers_submission(self):
+    def test_speculative_byte_budget_capacity_skips_submission(self):
         policy, host, _ = make_policy(speculative_max_bytes=100, chunk_bytes=60)
         keys_a = to_keys(1, prefix="a")
         keys_b = to_keys(1, prefix="b")
@@ -501,9 +573,21 @@ class TestCapacityAndBudget:
         policy.step(empty_step())
 
         assert host.submits == [keys_a]
+        assert counter(policy, AdmissionPrefetchMetrics.CAPACITY_SKIP) == 1
         policy.on_promotion_finished(keys_a, success=True)
         policy.step(empty_step())
-        assert host.submits == [keys_a, keys_b]
+        assert host.submits == [keys_a]
+        assert_partition(policy)
+
+    def test_pending_bundle_overflow_accounts_candidate_keys(self):
+        policy, host, _ = make_policy(max_pending_bundles=1)
+        admit(policy, host, "r0", to_keys(1, prefix="a"))
+        rejected = to_keys(3, prefix="b")
+
+        admit(policy, host, "r1", rejected)
+
+        assert counter(policy, AdmissionPrefetchMetrics.CAPACITY_SKIP) == 3
+        assert_partition(policy)
 
     def test_submit_capacity_skip_terminalizes_bundle(self):
         policy, host, _ = make_policy()

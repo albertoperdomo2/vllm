@@ -77,6 +77,16 @@ class Bundle:
     state: BundleState = BundleState.PENDING_LOOKUP
     outstanding: set[OffloadKey] = field(default_factory=set)
     any_load_failed: bool = False
+    demanded_while_pending: bool = False
+
+
+@dataclass
+class QueuedRequest:
+    """Queue observation captured before the per-request opt-in gate."""
+
+    admitted_at: float
+    queue_position: int
+    is_prefetch_candidate: bool = False
 
 
 class AdmissionPrefetchPolicy(PrefetchPolicy):
@@ -101,7 +111,7 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
         # Insertion-ordered non-terminal bundles; kept small so per-step work
         # is bounded by live bundles, not history.
         self._active: dict[str, None] = {}
-        self._admitted_unscheduled: OrderedDict[str, float] = OrderedDict()
+        self._admitted_unscheduled: OrderedDict[str, QueuedRequest] = OrderedDict()
         self._submitted_key_owner: dict[OffloadKey, str] = {}
         self._inflight_speculative_bytes = 0
         self._estimator = LeadTimeEstimator(config)
@@ -189,24 +199,31 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
     # PrefetchPolicy interface
     # ------------------------------------------------------------------
 
+    def on_request_enqueued(self, req_context: ReqContext) -> None:
+        req_id = req_context.req_id
+        if req_id in self._admitted_unscheduled:
+            return
+        self._admitted_unscheduled[req_id] = QueuedRequest(
+            admitted_at=self.clock(),
+            queue_position=len(self._admitted_unscheduled),
+        )
+
     def on_request_admitted(
         self, req_context: ReqContext, offload_keys: Sequence[OffloadKey]
     ) -> None:
         req_id = req_context.req_id
         if req_id in self._bundles:
             return
-        queue_position = len(self._admitted_unscheduled)
-        now = self.clock()
-        self._admitted_unscheduled[req_id] = now
+        queued = self._admitted_unscheduled.get(req_id)
+        if queued is None:
+            self.on_request_enqueued(req_context)
+            queued = self._admitted_unscheduled[req_id]
+        queued.is_prefetch_candidate = True
 
-        lead_time_ms = self._estimator.predict_ms(queue_position)
+        lead_time_ms = self._estimator.predict_ms(queued.queue_position)
         self._stats.observe_histogram(
             AdmissionPrefetchMetrics.LEAD_TIME, lead_time_ms / 1000.0
         )
-
-        if len(self._active) >= self.config.max_pending_bundles:
-            self._bundle_outcome("capacity_skip")
-            return
 
         window = list(offload_keys[: self.config.max_candidate_chunks])
         frontier = 0
@@ -223,12 +240,19 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
         if not self.host.prefetch_tier_allowed(self.config.tier_idx, req_context):
             return
 
+        if len(self._active) >= self.config.max_pending_bundles:
+            self._finalize_keys(
+                AdmissionPrefetchMetrics.CAPACITY_SKIP, len(window) - frontier
+            )
+            self._bundle_outcome("capacity_skip")
+            return
+
         bundle = Bundle(
             req_id=req_id,
             req_context=req_context,
             tier_idx=self.config.tier_idx,
             keys=window[frontier:],
-            admitted_at=now,
+            admitted_at=queued.admitted_at,
             lead_time_ms=lead_time_ms,
         )
         self._bundles[req_id] = bundle
@@ -239,14 +263,27 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
     def step(self, context: ScheduleEndContext) -> None:
         now = self.clock()
 
+        scheduled_count = 0
         for req_id in context.new_req_ids:
-            if self._admitted_unscheduled.pop(req_id, None) is not None:
-                self._estimator.on_first_scheduled(now)
+            queued = self._admitted_unscheduled.pop(req_id, None)
+            if queued is not None:
+                scheduled_count += 1
+                if queued.is_prefetch_candidate:
+                    self._stats.observe_histogram(
+                        AdmissionPrefetchMetrics.ACTUAL_LEAD_TIME,
+                        max(0.0, now - queued.admitted_at),
+                    )
             bundle = self._bundles.get(req_id)
             if bundle is not None and bundle.state is not BundleState.SUBMITTED:
                 # First demand ran during this step's scheduling pass, so
                 # any unsubmitted bundle missed its window.
                 self._late(bundle)
+
+        self._estimator.on_first_scheduled(
+            now,
+            scheduled_count,
+            queue_remains_nonempty=bool(self._admitted_unscheduled),
+        )
 
         for req_id in context.preempted_req_ids:
             bundle = self._bundles.get(req_id)
@@ -294,15 +331,28 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
         if bundle.state is BundleState.PENDING_LOOKUP:
             self._set_state(bundle, BundleState.RESIDENT)
 
-        # Cap the bundle at the per-step submission limit; the resolved tail
-        # beyond the cap can never be submitted and terminalizes as capacity.
-        cap = self.config.max_promotions_per_step
+        cap = min(bundle.resolved_run, key_budget)
+        if self.config.speculative_max_bytes > 0 and self.config.chunk_bytes > 0:
+            available_bytes = max(
+                0,
+                self.config.speculative_max_bytes - self._inflight_speculative_bytes,
+            )
+            cap = min(cap, available_bytes // self.config.chunk_bytes)
+
+        # A fully resolved residency verdict is consumed in this step. Keeping
+        # it across steps would turn a mutable-tier snapshot into a stale fact.
         if bundle.resolved_run > cap:
             self._finalize_keys(
-                AdmissionPrefetchMetrics.CAPACITY_SKIP, bundle.resolved_run - cap
+                AdmissionPrefetchMetrics.CAPACITY_SKIP,
+                bundle.resolved_run - cap,
             )
             del bundle.keys[cap:]
             bundle.resolved_run = cap
+
+        if bundle.resolved_run == 0:
+            self._bundle_outcome("capacity_skip")
+            self._set_state(bundle, BundleState.CAPACITY_SKIPPED)
+            return key_budget
 
         bundle_len = bundle.resolved_run
         prefetch_latency_ms = transfer_time_ms(self.config, bundle_len)
@@ -312,16 +362,6 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
         expected_utility_ms = utility_ms(self.config, bundle_len)
         if expected_utility_ms <= 0:
             self._gate_reject(bundle, "gate_reject_utility")
-            return key_budget
-
-        if bundle_len > key_budget:
-            return key_budget
-        if (
-            not self.config.shadow_mode
-            and self.config.speculative_max_bytes > 0
-            and self._inflight_speculative_bytes + bundle_len * self.config.chunk_bytes
-            > self.config.speculative_max_bytes
-        ):
             return key_budget
 
         logger.debug(
@@ -361,7 +401,6 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
             self._inflight_speculative_bytes += (
                 len(submit_result.submitted) * self.config.chunk_bytes
             )
-            self._bundle_outcome("submitted")
             self._set_state(bundle, BundleState.SUBMITTED)
         elif submit_result.capacity_skipped:
             self._bundle_outcome("capacity_skip")
@@ -370,6 +409,16 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
             self._bundle_outcome("redundant")
             self._set_state(bundle, BundleState.CAPACITY_SKIPPED)
         return key_budget - len(submit_result.submitted)
+
+    def on_prefetch_demand(self, key: OffloadKey, primary_result: LookupResult) -> None:
+        if primary_result is not LookupResult.HIT_PENDING:
+            return
+        req_id = self._submitted_key_owner.get(key)
+        if req_id is None:
+            return
+        bundle = self._bundles.get(req_id)
+        if bundle is not None:
+            bundle.demanded_while_pending = True
 
     def on_promotion_finished(self, keys: Sequence[OffloadKey], success: bool) -> None:
         touched: set[str] = set()
@@ -392,12 +441,17 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
             if bundle.any_load_failed:
                 self._bundle_outcome("failed")
                 self._set_state(bundle, BundleState.FAILED)
+            elif bundle.demanded_while_pending:
+                self._bundle_outcome("late")
+                self._set_state(bundle, BundleState.LATE)
             else:
                 self._bundle_outcome("ready")
                 self._set_state(bundle, BundleState.READY)
 
     def on_request_finished(self, req_id: str) -> None:
         self._admitted_unscheduled.pop(req_id, None)
+        if not self._admitted_unscheduled:
+            self._estimator.on_queue_idle()
         bundle = self._bundles.get(req_id)
         if bundle is not None and bundle.state is not BundleState.SUBMITTED:
             # Removing the bundle guarantees no further lookups are issued
@@ -418,3 +472,4 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
                 self._cancel(bundle, "cancelled_reset")
         self._admitted_unscheduled.clear()
         self._inflight_speculative_bytes = 0
+        self._estimator.reset()

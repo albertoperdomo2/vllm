@@ -36,7 +36,8 @@ class PrefetchConfig:
     transfer_per_chunk_ms: float = 2.0
     # U(B) = p_use * demand_load_per_chunk_ms * |B|
     #        - delta_q_active_ms - c_failure_ms
-    # E[C_eviction] is zero by construction: allocation never evicts.
+    # E[C_eviction] is zero by construction: allocation never evicts and
+    # later demand reclaims speculative capacity before ordinary victims.
     p_use: float = 0.9
     demand_load_per_chunk_ms: float = 2.0
     delta_q_active_ms: float = 0.0

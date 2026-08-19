@@ -1033,3 +1033,26 @@ def test_prepare_store_no_evict_release_frees_blocks():
     assert manager._get_num_free_blocks() == before
     for key in keys:
         assert manager.lookup(key, _EMPTY_REQ_CTX) is LookupResult.MISS
+
+
+@pytest.mark.parametrize("eviction_policy", ["lru", "arc"])
+def test_demand_reclaims_speculative_blocks_first(eviction_policy):
+    manager = make_cpu_manager(num_blocks=3, cache_policy=eviction_policy)
+    demand = to_keys([1, 2])
+    speculative = to_keys([3])
+    output = manager.prepare_store(demand, _EMPTY_REQ_CTX)
+    assert output is not None
+    manager.complete_store(demand, _EMPTY_REQ_CTX)
+    output = manager.prepare_store(speculative, _EMPTY_REQ_CTX, allow_eviction=False)
+    assert output is not None
+    manager.complete_store(speculative, _EMPTY_REQ_CTX)
+    manager.mark_speculative(speculative)
+
+    output = manager.prepare_store(to_keys([4, 5]), _EMPTY_REQ_CTX)
+
+    assert output is not None
+    assert speculative[0] in output.evicted_keys
+    assert (
+        sum(manager.lookup(key, _EMPTY_REQ_CTX) is LookupResult.HIT for key in demand)
+        == 1
+    )
