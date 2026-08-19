@@ -57,6 +57,7 @@ from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
 )
+from vllm.v1.kv_offload.tiering.prefetch.base import AdmissionPrefetchMetrics
 from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 
 _CTX = ReqContext(req_id="test")
@@ -279,6 +280,107 @@ def test_enabled_admission_prefetch_requires_secondary_tier():
             primary_tier=primary_tier,
             admission_prefetch_chunks=1,
         )
+
+
+def test_tiering_spec_defines_admission_prefetch_metrics():
+    """V2 policy counters need declarable metadata with exact label arity.
+
+    build_metric_definitions runs before any manager exists, so the
+    definitions must come from the raw extra_config alone.
+    """
+    metrics = TieringOffloadingSpec.build_metric_definitions({})
+
+    for name in (
+        AdmissionPrefetchMetrics.CONSIDERED,
+        *AdmissionPrefetchMetrics.TERMINAL_COUNTERS,
+    ):
+        metadata = metrics[name]
+        assert isinstance(metadata, OffloadingCounterMetadata)
+        assert metadata.labelnames == ("tier",)
+
+    assert metrics[AdmissionPrefetchMetrics.BUNDLE_OUTCOMES].labelnames == (
+        "tier",
+        "outcome",
+    )
+    assert metrics[AdmissionPrefetchMetrics.TRANSITIONS].labelnames == ("transition",)
+
+
+def test_tiering_spec_defaults_prefetch_config_to_none():
+    assert _make_tiering_spec().prefetch_config is None
+
+
+def test_tiering_spec_prefetch_defaults_to_shadow_mode():
+    spec = _make_tiering_spec(
+        {
+            "prefetch": {"enabled": True},
+            "secondary_tiers": [{"type": "example"}],
+        }
+    )
+
+    # Live submission must be an explicit opt-in until V2.0 calibration.
+    assert spec.prefetch_config.shadow_mode is True
+    assert spec.prefetch_config.policy == "admission"
+
+
+def test_tiering_spec_rejects_prefetch_with_v1_chunks():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _make_tiering_spec(
+            {
+                "prefetch": {"enabled": True},
+                "admission_prefetch_chunks": 100,
+                "secondary_tiers": [{"type": "example"}],
+            }
+        )
+
+
+def test_tiering_spec_rejects_prefetch_without_secondary_tier():
+    with pytest.raises(ValueError, match="at least one secondary tier"):
+        _make_tiering_spec({"prefetch": {"enabled": True}})
+
+
+def test_tiering_spec_rejects_prefetch_tier_idx_out_of_range():
+    with pytest.raises(ValueError, match="out of range"):
+        _make_tiering_spec(
+            {
+                "prefetch": {"enabled": True, "tier_idx": 4},
+                "secondary_tiers": [{"type": "example"}],
+            }
+        )
+
+
+def test_tiering_spec_rejects_unknown_prefetch_policy():
+    with pytest.raises(ValueError, match="Unknown prefetch policy"):
+        _make_tiering_spec(
+            {
+                "prefetch": {"enabled": True, "policy": "nope"},
+                "secondary_tiers": [{"type": "example"}],
+            }
+        )
+
+
+def test_tiering_spec_rejects_unknown_prefetch_keys():
+    with pytest.raises(ValueError, match="Unknown prefetch config keys"):
+        _make_tiering_spec({"prefetch": {"enabled": True, "shadow": True}})
+
+
+@pytest.mark.parametrize(
+    "prefetch_config,message",
+    [
+        ({"enabled": 1}, "must be a boolean"),
+        ({"shadow_mode": "yes"}, "must be a boolean"),
+        ({"max_pending_bundles": 0}, "must be >= 1"),
+        ({"max_pending_bundles": True}, "must be an integer"),
+        ({"max_promotions_per_step": -1}, "must be >= 1"),
+        ({"speculative_max_bytes": -1}, "must be >= 0"),
+        ({"transfer_base_ms": -1.0}, "must be finite and >= 0"),
+        ({"admission_interval_ewma_alpha": 0.0}, "must be in \\(0, 1\\]"),
+        ({"p_use": 1.5}, "must be in \\[0, 1\\]"),
+        ({"policy": ""}, "must be a non-empty string"),
+    ],
+)
+def test_tiering_spec_rejects_invalid_prefetch_values(prefetch_config, message):
+    with pytest.raises(ValueError, match=message):
+        _make_tiering_spec({"prefetch": prefetch_config})
 
 
 def test_tiering_manager_aggregates_secondary_stats():

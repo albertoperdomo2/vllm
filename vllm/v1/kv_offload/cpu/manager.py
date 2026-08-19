@@ -167,7 +167,17 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
+        *,
+        allow_eviction: bool = True,
     ) -> PrepareStoreOutput | None:
+        """Allocate primary blocks for the given keys.
+
+        Args:
+            allow_eviction: when False, allocate only from currently free
+                blocks and return None rather than evicting. Speculative
+                callers use this so a prefetch can never displace a block
+                that demand is about to need.
+        """
         if self.counts is not None:
             num_keys = len(keys)
             keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
@@ -187,6 +197,8 @@ class CPUOffloadingManager(OffloadingManager):
 
         to_evict: list[OffloadKey] = []
         if num_blocks_to_evict > 0:
+            if not allow_eviction:
+                return None
             if num_blocks_to_evict > self._num_evictable_cache_blocks:
                 # Eviction will fail.
                 return None

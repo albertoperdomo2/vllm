@@ -781,3 +781,83 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         assert torch.allclose(reader_tensor[1], expected)
     finally:
         reader.shutdown()
+
+
+def test_admission_prefetch_end_to_end_with_fs_tier(tmp_path):
+    """V2.1 prefetch against a real async fs tier.
+
+    The fs tier resolves residency on a worker thread, so this covers the
+    genuine multi-step lookup latency and thread handoff that the in-memory
+    stubs cannot reproduce.
+    """
+    from vllm.v1.kv_offload.base import ReqContext as _ReqContext
+    from vllm.v1.kv_offload.tiering.manager import (
+        CPUPrimaryTierOffloadingManager,
+        TieringOffloadingManager,
+    )
+    from vllm.v1.kv_offload.tiering.prefetch.base import AdmissionPrefetchMetrics
+    from vllm.v1.kv_offload.tiering.prefetch.config import PrefetchConfig
+
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    view = memoryview(tensor.numpy())
+    mock_region = MagicMock()
+    mock_region.create_kv_memoryview.return_value = view
+    primary = CPUPrimaryTierOffloadingManager(
+        num_blocks=_NUM_BLOCKS, mmap_region=mock_region
+    )
+    tier = FileSystemTierManager(
+        offloading_spec=_make_offloading_spec(),
+        primary_kv_view=primary.get_kv_memoryview(),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+    )
+    manager = TieringOffloadingManager(
+        primary_tier=primary,
+        secondary_tiers=[tier],
+        prefetch_config=PrefetchConfig(
+            enabled=True,
+            shadow_mode=False,
+            initial_admission_interval_ms=10_000.0,
+        ),
+    )
+    try:
+        keys = [key(1), key(2)]
+        # Populate the fs tier so the keys are genuinely resident.
+        store_ctx = _ReqContext(req_id="populate")
+        manager.on_new_request(store_ctx)
+        assert manager.prepare_store(keys, store_ctx) is not None
+        manager.complete_store(keys, store_ctx)
+
+        empty = ScheduleEndContext(new_req_ids=[], preempted_req_ids=())
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and tier.has_pending_work():
+            manager.on_schedule_end(empty)
+            time.sleep(0.01)
+        manager.on_request_finished(store_ctx)
+
+        # Evict the keys from CPU so prefetch has real work to do.
+        manager.reset_cache()
+
+        for i in range(3):
+            filler = _ReqContext(req_id=f"filler{i}")
+            manager.on_new_request(filler)
+            manager.prefetch_on_admission([], filler)
+        prefetch_ctx = _ReqContext(req_id="prefetcher")
+        manager.on_new_request(prefetch_ctx)
+        manager.prefetch_on_admission(keys, prefetch_ctx)
+
+        policy = manager._prefetch_policy
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and policy.has_pending_work():
+            manager.on_schedule_end(empty)
+            time.sleep(0.01)
+
+        stats = policy._stats._values
+        submitted = stats.get(AdmissionPrefetchMetrics.SUBMITTED, {})
+        assert sum(submitted.values()) == len(keys)
+
+        # The promoted copies are what a later demand lookup would consume.
+        for k in keys:
+            assert primary.lookup(k, prefetch_ctx) is LookupResult.HIT
+    finally:
+        tier.shutdown()

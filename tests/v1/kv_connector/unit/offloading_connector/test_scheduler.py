@@ -1280,6 +1280,122 @@ class TestAdmissionPrefetch:
         assert calls == ["manager_on_new_request", "prefetch"]
 
 
+class TestPolicyAdmissionPrefetch:
+    """The V2 policy branch of the admission hook."""
+
+    @staticmethod
+    def _make_policy_scheduler(**kwargs):
+        manager = MagicMock()
+        manager.prefetch_policy_enabled = True
+        manager.prefetch_on_admission = MagicMock()
+        manager.prefetch_assume_resident = MagicMock()
+        manager.admission_prefetch_chunks = 0
+        manager.on_new_request.return_value = RequestOffloadingContext()
+        return _make_admission_scheduler(manager=manager, **kwargs)
+
+    def test_policy_receives_full_ordered_key_list(self):
+        scheduler = self._make_policy_scheduler()
+        request = _make_admission_request(
+            5, kv_transfer_params={"abc_admission_prefetch": True}
+        )
+
+        scheduler.on_new_request(request)
+
+        # No truncation here: the policy owns candidate-window selection.
+        scheduler.manager.prefetch_on_admission.assert_called_once()
+        keys, req_context = scheduler.manager.prefetch_on_admission.call_args.args
+        assert list(keys) == [
+            make_offload_key(BlockHash(str(i).encode()), 0) for i in range(5)
+        ]
+        assert req_context.req_id == request.request_id
+        # The V1 blind path must not also run.
+        scheduler.manager.prefetch_assume_resident.assert_not_called()
+
+    def test_policy_takes_precedence_over_v1_chunks(self):
+        scheduler = self._make_policy_scheduler()
+        scheduler.manager.admission_prefetch_chunks = 100
+        request = _make_admission_request(
+            3, kv_transfer_params={"abc_admission_prefetch": True}
+        )
+
+        scheduler.on_new_request(request)
+
+        scheduler.manager.prefetch_on_admission.assert_called_once()
+        scheduler.manager.prefetch_assume_resident.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "kv_transfer_params", [None, {}, {"abc_admission_prefetch": False}]
+    )
+    def test_unmarked_request_does_not_reach_policy(self, kv_transfer_params):
+        scheduler = self._make_policy_scheduler()
+        request = _make_admission_request(3, kv_transfer_params=kv_transfer_params)
+
+        scheduler.on_new_request(request)
+
+        scheduler.manager.prefetch_on_admission.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "group_configs,test_id",
+        [
+            ((_make_admission_group_config(sliding_window_size_in_chunks=2),), "sw"),
+            ((_make_admission_group_config(is_eagle_group=True),), "eagle"),
+            (
+                (
+                    _make_admission_group_config(group_idx=0),
+                    _make_admission_group_config(group_idx=1),
+                ),
+                "multi-group",
+            ),
+        ],
+    )
+    def test_unsupported_group_layout_does_not_reach_policy(
+        self, group_configs, test_id
+    ):
+        scheduler = self._make_policy_scheduler(group_configs=group_configs)
+        request = _make_admission_request(
+            3, kv_transfer_params={"abc_admission_prefetch": True}
+        )
+
+        scheduler.on_new_request(request)
+
+        scheduler.manager.prefetch_on_admission.assert_not_called()
+
+    def test_disabled_policy_falls_back_to_v1(self):
+        scheduler = self._make_policy_scheduler()
+        scheduler.manager.prefetch_policy_enabled = False
+        scheduler.manager.admission_prefetch_chunks = 2
+        request = _make_admission_request(
+            5, kv_transfer_params={"abc_admission_prefetch": True}
+        )
+
+        scheduler.on_new_request(request)
+
+        scheduler.manager.prefetch_on_admission.assert_not_called()
+        scheduler.manager.prefetch_assume_resident.assert_called_once()
+
+    def test_state_is_registered_before_policy_admission(self):
+        scheduler = self._make_policy_scheduler()
+        request = _make_admission_request(
+            3, kv_transfer_params={"abc_admission_prefetch": True}
+        )
+        calls = []
+
+        def on_new_request(req_context):
+            calls.append("manager_on_new_request")
+            return RequestOffloadingContext()
+
+        def policy_admit(keys, req_context):
+            calls.append("policy")
+            assert request.request_id in scheduler._req_status
+
+        scheduler.manager.on_new_request.side_effect = on_new_request
+        scheduler.manager.prefetch_on_admission.side_effect = policy_admit
+
+        scheduler.on_new_request(request)
+
+        assert calls == ["manager_on_new_request", "policy"]
+
+
 class TestMaximalPrefixLookup:
     def test_all_hit(self):
         sched = _make_scheduler_with_lookup({1: LookupResult.HIT, 2: LookupResult.HIT})

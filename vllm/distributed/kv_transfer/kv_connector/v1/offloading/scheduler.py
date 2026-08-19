@@ -807,9 +807,19 @@ class OffloadingConnectorScheduler:
         if params.get(ABC_ADMISSION_PREFETCH_KEY) is not True:
             return
 
+        # Both prefetch paths are duck-typed: the tiering manager exposes
+        # them, other OffloadingManager implementations need not.
+        # V2 residency/deadline-gated policy, when the manager runs one.
+        policy_prefetch: Any = getattr(self.manager, "prefetch_on_admission", None)
+        policy_enabled = getattr(self.manager, "prefetch_policy_enabled", False)
+        # V1 blind first-N selection, retained as the benchmark baseline.
         n = getattr(self.manager, "admission_prefetch_chunks", 0)
-        prefetch = getattr(self.manager, "prefetch_assume_resident", None)
-        if n <= 0 or prefetch is None:
+        prefetch: Any = getattr(self.manager, "prefetch_assume_resident", None)
+
+        # Strict identity, as with the request opt-in above: only a manager
+        # that really runs a policy takes the V2 path.
+        use_policy = policy_enabled is True and policy_prefetch is not None
+        if not use_policy and (n <= 0 or prefetch is None):
             return
 
         if len(self.config.kv_group_configs) != 1:
@@ -832,8 +842,13 @@ class OffloadingConnectorScheduler:
             return
 
         req_status.update_offload_keys()
-        keys = req_status.group_states[0].offload_keys[:n]
-        prefetch(keys, req_status.req_context, tier_idx=0)
+        keys = req_status.group_states[0].offload_keys
+        if use_policy:
+            # The policy applies its own candidate window and selects an
+            # ordered contiguous prefix bundle from the full key list.
+            policy_prefetch(keys, req_status.req_context)
+        else:
+            prefetch(keys[:n], req_status.req_context, tier_idx=0)
 
     def on_new_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""

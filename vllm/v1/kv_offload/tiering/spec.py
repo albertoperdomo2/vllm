@@ -20,6 +20,27 @@ Configuration via kv_connector_extra_config:
     attribute the useful/wasted outcome counters; 0 disables outcome tracking,
     in which case every promotion is counted as PREFETCH_UNTRACKED
     (default: 8192)
+  - admission_prefetch_chunks: (optional) blind first-N proactive promotion at
+    request admission; requires a secondary tier and a per-request
+    kv_transfer_params.abc_admission_prefetch=true opt-in. Mutually exclusive
+    with "prefetch" (default: 0, disabled)
+  - prefetch: (optional) residency- and deadline-gated prefetch policy. Selects
+    ordered contiguous prefix bundles at admission, verifies secondary
+    residency, and promotes only when predicted lead time can hide the
+    calibrated transfer time. Keys:
+      - enabled: (default false)
+      - policy / policy_module_path: policy name registered with
+        PrefetchPolicyFactory ("admission"), or an out-of-tree class name
+        paired with a module path
+      - shadow_mode: (default TRUE) evaluate and log gate decisions without
+        moving any data. Keep enabled until the transfer/lead-time constants
+        below are calibrated for the deployment
+      - tier_idx, max_pending_bundles, max_promotions_per_step,
+        max_candidate_chunks, speculative_max_bytes: bounds on policy work
+      - initial_admission_interval_ms, admission_interval_ewma_alpha,
+        transfer_base_ms, transfer_per_chunk_ms, p_use,
+        demand_load_per_chunk_ms, delta_q_active_ms, c_failure_ms:
+        UNCALIBRATED lead-time and utility constants
   - secondary_tiers: (optional) List of secondary tier configurations
     Each secondary tier config is a dict with:
       - type: (required) Type of secondary tier (e.g., "example", "storage", "network")
@@ -40,6 +61,7 @@ Example configuration:
 }
 """
 
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -64,6 +86,11 @@ from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
 )
+from vllm.v1.kv_offload.tiering.prefetch.base import (
+    build_admission_prefetch_metric_definitions,
+)
+from vllm.v1.kv_offload.tiering.prefetch.config import PrefetchConfig
+from vllm.v1.kv_offload.tiering.prefetch.factory import PrefetchPolicyFactory
 
 logger = init_logger(__name__)
 
@@ -213,6 +240,11 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             labelnames=("tier",),
         )
 
+        prefetch_config = extra_config.get("prefetch") or {}
+        if not isinstance(prefetch_config, dict):
+            raise ValueError("prefetch must be a mapping")
+        metrics.update(build_admission_prefetch_metric_definitions(prefetch_config))
+
         secondary_tier_configs = extra_config.get("secondary_tiers", [])
         if not isinstance(secondary_tier_configs, list):
             raise ValueError("secondary_tiers must be a list of tier configurations")
@@ -258,6 +290,29 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 f"{prefetch_track_capacity!r}"
             )
         self.prefetch_track_capacity = prefetch_track_capacity
+
+        self.prefetch_config = PrefetchConfig.from_extra_config(self.extra_config)
+        if self.prefetch_config is not None and self.prefetch_config.enabled:
+            if admission_prefetch_chunks > 0:
+                raise ValueError(
+                    "prefetch.enabled and admission_prefetch_chunks are "
+                    "mutually exclusive: the V2 policy replaces the V1 "
+                    "blind first-N selection"
+                )
+            if not self.secondary_tier_configs:
+                raise ValueError(
+                    "prefetch.enabled requires at least one secondary tier"
+                )
+            if self.prefetch_config.tier_idx >= len(self.secondary_tier_configs):
+                raise ValueError(
+                    f"prefetch.tier_idx {self.prefetch_config.tier_idx} is out of "
+                    f"range for {len(self.secondary_tier_configs)} secondary tier(s)"
+                )
+            # Resolve now so an unknown policy name fails at startup.
+            PrefetchPolicyFactory.get_prefetch_policy_cls(
+                self.prefetch_config.policy,
+                self.prefetch_config.policy_module_path,
+            )
 
         # Scheduler-side mmap (rank=None); kept for cleanup
         self._scheduler_mmap: SharedOffloadRegion | None = None
@@ -325,11 +380,18 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             # Create TieringOffloadingManager. GPU↔CPU transfers use the inherited
             # get_worker(). Secondary tier transfers are handled by the
             # secondary tier managers and need no additional workers here.
+            prefetch_config = self.prefetch_config
+            if prefetch_config is not None:
+                prefetch_config = replace(
+                    prefetch_config, chunk_bytes=self.kv_bytes_per_chunk
+                )
+
             tiering_manager = TieringOffloadingManager(
                 primary_tier=primary_tier,
                 secondary_tiers=secondary_tiers,
                 admission_prefetch_chunks=self.admission_prefetch_chunks,
                 prefetch_track_capacity=self.prefetch_track_capacity,
+                prefetch_config=prefetch_config,
             )
             if int(self.extra_config.get("store_threshold", 0)) >= 2:
                 raise ValueError(

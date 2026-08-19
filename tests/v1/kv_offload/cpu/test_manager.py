@@ -971,3 +971,65 @@ def test_touch_forwards_req_context_to_policy(monkeypatch):
     assert len(received) == 1
     assert received[0][0] == keys
     assert received[0][1] is ctx
+
+
+def test_prepare_store_no_evict_refuses_instead_of_evicting():
+    """Speculative allocation must never displace demand-useful blocks."""
+    manager = make_cpu_manager(num_blocks=2)
+    resident = to_keys([1, 2])
+    output = manager.prepare_store(resident, _EMPTY_REQ_CTX)
+    assert output is not None
+    manager.complete_store(resident, _EMPTY_REQ_CTX)
+
+    # The tier is full but everything in it is evictable, so the default
+    # path would succeed by evicting. The speculative path must not.
+    assert (
+        manager.prepare_store(to_keys([3]), _EMPTY_REQ_CTX, allow_eviction=False)
+        is None
+    )
+
+    for key in resident:
+        assert manager.lookup(key, _EMPTY_REQ_CTX) is LookupResult.HIT
+
+
+def test_prepare_store_no_evict_allocates_from_free_blocks():
+    manager = make_cpu_manager(num_blocks=4)
+    output = manager.prepare_store(
+        to_keys([1, 2]), _EMPTY_REQ_CTX, allow_eviction=False
+    )
+
+    assert output is not None
+    assert list(output.keys_to_store) == to_keys([1, 2])
+    assert output.evicted_keys == []
+
+
+def test_prepare_store_no_evict_allocates_each_key_once():
+    """One allocation per key: no reserve-then-consume double spend."""
+    manager = make_cpu_manager(num_blocks=4)
+    keys = to_keys([1, 2])
+    output = manager.prepare_store(keys, _EMPTY_REQ_CTX, allow_eviction=False)
+    assert output is not None
+    manager.complete_store(keys, _EMPTY_REQ_CTX)
+
+    free_after = manager._get_num_free_blocks()
+    # Re-preparing the same keys is a no-op: they are already stored.
+    repeat = manager.prepare_store(keys, _EMPTY_REQ_CTX, allow_eviction=False)
+    assert repeat is not None
+    assert list(repeat.keys_to_store) == []
+    assert manager._get_num_free_blocks() == free_after
+
+
+def test_prepare_store_no_evict_release_frees_blocks():
+    """A cancelled speculative allocation returns its blocks to the pool."""
+    manager = make_cpu_manager(num_blocks=4)
+    keys = to_keys([1, 2])
+    before = manager._get_num_free_blocks()
+    output = manager.prepare_store(keys, _EMPTY_REQ_CTX, allow_eviction=False)
+    assert output is not None
+    assert manager._get_num_free_blocks() < before
+
+    manager.complete_store(keys, _EMPTY_REQ_CTX, success=False)
+
+    assert manager._get_num_free_blocks() == before
+    for key in keys:
+        assert manager.lookup(key, _EMPTY_REQ_CTX) is LookupResult.MISS

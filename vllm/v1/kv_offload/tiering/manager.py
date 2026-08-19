@@ -54,6 +54,12 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
     TieringOffloadingMetrics,
 )
+from vllm.v1.kv_offload.tiering.prefetch.base import (
+    AdmissionSubmitResult,
+    PrefetchPolicy,
+)
+from vllm.v1.kv_offload.tiering.prefetch.config import PrefetchConfig
+from vllm.v1.kv_offload.tiering.prefetch.factory import PrefetchPolicyFactory
 
 logger = init_logger(__name__)
 
@@ -187,6 +193,7 @@ class TieringOffloadingManager(OffloadingManager):
         secondary_tiers: list[SecondaryTierManager] | None = None,
         admission_prefetch_chunks: int = 0,
         prefetch_track_capacity: int = DEFAULT_PREFETCH_TRACK_CAPACITY,
+        prefetch_config: "PrefetchConfig | None" = None,
     ):
         """
         Initialize the TieringOffloadingManager.
@@ -200,6 +207,9 @@ class TieringOffloadingManager(OffloadingManager):
             prefetch_track_capacity: Max keys tracked for prefetch outcome
                             metrics. 0 disables outcome tracking, counting
                             every promotion as PREFETCH_UNTRACKED.
+            prefetch_config: Configuration for the residency- and
+                            deadline-gated prefetch policy. Mutually
+                            exclusive with admission_prefetch_chunks.
         """
         self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
@@ -211,6 +221,25 @@ class TieringOffloadingManager(OffloadingManager):
             raise ValueError(
                 "admission_prefetch_chunks requires at least one secondary tier"
             )
+
+        self._prefetch_policy: PrefetchPolicy | None = None
+        if prefetch_config is not None and prefetch_config.enabled:
+            if self._admission_prefetch_chunks > 0:
+                raise ValueError(
+                    "prefetch.enabled and admission_prefetch_chunks are "
+                    "mutually exclusive"
+                )
+            if not self.secondary_tiers:
+                raise ValueError("prefetch requires at least one secondary tier")
+            if prefetch_config.tier_idx >= len(self.secondary_tiers):
+                raise ValueError(
+                    f"prefetch.tier_idx {prefetch_config.tier_idx} is out of range "
+                    f"for {len(self.secondary_tiers)} secondary tier(s)"
+                )
+            policy_cls = PrefetchPolicyFactory.get_prefetch_policy_cls(
+                prefetch_config.policy, prefetch_config.policy_module_path
+            )
+            self._prefetch_policy = policy_cls(prefetch_config, self)
 
         # Proactively promoted keys awaiting a demand lookup, oldest
         # first; value is the originating tier index so the outcome counters
@@ -309,16 +338,21 @@ class TieringOffloadingManager(OffloadingManager):
                         completed_job.success,
                     )
 
-                    if prefetch_job is not None and not completed_job.success:
+                    if prefetch_job is not None:
                         tier_idx, prefetch_keys = prefetch_job
-                        self._stats.increase_counter(
-                            TieringOffloadingMetrics.PREFETCH_LOAD_FAILED,
-                            len(prefetch_keys),
-                            self._tier_label(tier_idx),
-                        )
-                        for key in prefetch_keys:
-                            self._prefetched.pop(key, None)
-                            self._late_prefetches.discard(key)
+                        if not completed_job.success:
+                            self._stats.increase_counter(
+                                TieringOffloadingMetrics.PREFETCH_LOAD_FAILED,
+                                len(prefetch_keys),
+                                self._tier_label(tier_idx),
+                            )
+                            for key in prefetch_keys:
+                                self._prefetched.pop(key, None)
+                                self._late_prefetches.discard(key)
+                        if self._prefetch_policy is not None:
+                            self._prefetch_policy.on_promotion_finished(
+                                prefetch_keys, completed_job.success
+                            )
                 else:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary blocks.
@@ -386,6 +420,90 @@ class TieringOffloadingManager(OffloadingManager):
                 )
 
         return initiated
+
+    # ------------------------------------------------------------------
+    # PrefetchHost surface (V2 policy-driven prefetch)
+    # ------------------------------------------------------------------
+
+    @property
+    def prefetch_policy_enabled(self) -> bool:
+        return self._prefetch_policy is not None
+
+    def prefetch_on_admission(
+        self, keys: Sequence[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Offer an admitted request's ordered keys to the prefetch policy."""
+        if self._prefetch_policy is not None:
+            self._prefetch_policy.on_request_admitted(req_context, keys)
+
+    def prefetch_tier_label(self, tier_idx: int) -> tuple[str]:
+        return self._tier_label(tier_idx)
+
+    def prefetch_tier_allowed(self, tier_idx: int, req_context: ReqContext) -> bool:
+        tier = self.secondary_tiers[tier_idx]
+        return req_context.load_tier_filter.allows(tier.medium, tier.locality)
+
+    def prefetch_primary_lookup(
+        self, key: OffloadKey, req_context: ReqContext
+    ) -> LookupResult:
+        return self.primary_tier.lookup(key, req_context)
+
+    def prefetch_secondary_lookup(
+        self, tier_idx: int, key: OffloadKey, req_context: ReqContext
+    ) -> LookupResult:
+        """Residency probe against one secondary tier.
+
+        May return RETRY while the tier's batched async lookup is pending;
+        the policy keeps the bundle pending and re-drives on later steps.
+        """
+        return self.secondary_tiers[tier_idx].lookup(key, req_context)
+
+    def prefetch_submit(
+        self,
+        tier_idx: int,
+        keys: Sequence[OffloadKey],
+        req_context: ReqContext,
+    ) -> AdmissionSubmitResult:
+        """Submit a gated bundle for non-evicting proactive promotion.
+
+        Every key is reported in exactly one bucket of the result, so the
+        policy's terminal accounting stays exact. Allocation refusal ends
+        the run: the already-submitted prefix stays contiguous from the
+        frontier, which is what the demand scan can consume.
+        """
+        tier = self.secondary_tiers[tier_idx]
+        label = self._tier_label(tier_idx)
+        result = AdmissionSubmitResult()
+
+        for idx, key in enumerate(keys):
+            primary_result = self.primary_tier.lookup(key, req_context)
+            if primary_result in (LookupResult.HIT, LookupResult.HIT_PENDING):
+                result.primary_redundant.append(key)
+                continue
+
+            self._stats.increase_counter(
+                TieringOffloadingMetrics.PREFETCH_ATTEMPTED,
+                labelvalues=label,
+            )
+            if self._initiate_promotion(
+                tier, key, req_context, is_prefetch=True, allow_eviction=False
+            ):
+                result.submitted.append(key)
+                self._stats.increase_counter(
+                    TieringOffloadingMetrics.PREFETCH_PROMOTED,
+                    labelvalues=label,
+                )
+                self._track_prefetched(key, tier_idx)
+            else:
+                # Capacity refusal is normal operation for speculative work.
+                self._stats.increase_counter(
+                    TieringOffloadingMetrics.PREFETCH_SKIPPED,
+                    labelvalues=label,
+                )
+                result.capacity_skipped.extend(keys[idx:])
+                break
+
+        return result
 
     def _track_prefetched(self, key: OffloadKey, tier_idx: int) -> None:
         """Record a prefetch-promoted key until a demand lookup resolves it."""
@@ -569,6 +687,7 @@ class TieringOffloadingManager(OffloadingManager):
         req_context: ReqContext,
         *,
         is_prefetch: bool = False,
+        allow_eviction: bool = True,
     ) -> bool:
         """
         Queue a block for promotion from a secondary tier to the primary tier.
@@ -591,7 +710,9 @@ class TieringOffloadingManager(OffloadingManager):
         # Must happen immediately so primary.lookup() returns None (in-flight)
         # for this key on any subsequent lookup() call within the same step,
         # preventing duplicate promotion attempts.
-        primary_write_result = self.primary_tier.prepare_write([key], req_context)
+        primary_write_result = self.primary_tier.prepare_write(
+            [key], req_context, allow_eviction=allow_eviction
+        )
 
         if primary_write_result is None:
             # Primary tier is full; caller should treat the block as unavailable
@@ -894,6 +1015,11 @@ class TieringOffloadingManager(OffloadingManager):
         exclude_tier: SecondaryTierManager | None = None,
     ) -> None:
         self.primary_tier.on_request_finished(req_context)
+        if self._prefetch_policy is not None:
+            # Cancel immediately rather than waiting for tier finalization:
+            # the policy must stop issuing lookups before the tier's async
+            # lookup state is cleaned up.
+            self._prefetch_policy.on_request_finished(req_context.req_id)
         state = self._req_state[req_context.req_id]
         state.is_finished = True
         self._maybe_finalize_request(req_context.req_id, exclude_tier)
@@ -943,6 +1069,13 @@ class TieringOffloadingManager(OffloadingManager):
         # lookup() calls within it skip redundant _process_finished_jobs().
         self._processed_jobs_this_step = False
 
+        # Drive the prefetch policy after completions are visible and demand
+        # has had its turn, but before the flush, so submissions this step
+        # join this step's batched submit_load() and the lookups they issue
+        # are flushed by the tiers' on_schedule_end() below.
+        if self._prefetch_policy is not None:
+            self._prefetch_policy.step(context)
+
         self._flush_pending_promotions()
         for tier in self.secondary_tiers:
             tier.on_schedule_end(context)
@@ -959,8 +1092,16 @@ class TieringOffloadingManager(OffloadingManager):
         # In-flight primary<->secondary transfers (pending promotions are
         # translated to transfer jobs in on_schedule_end), plus any work the
         # secondary tiers themselves still have outstanding.
-        return bool(self._transfer_jobs) or any(
-            tier.has_pending_work() for tier in self.secondary_tiers
+        # Policy state counts too: a bundle awaiting residency results needs
+        # further steps to resolve, and the engine must keep stepping for
+        # on_schedule_end() to re-drive it.
+        return (
+            bool(self._transfer_jobs)
+            or any(tier.has_pending_work() for tier in self.secondary_tiers)
+            or (
+                self._prefetch_policy is not None
+                and self._prefetch_policy.has_pending_work()
+            )
         )
 
     @override
@@ -1006,6 +1147,11 @@ class TieringOffloadingManager(OffloadingManager):
         self._prefetched.clear()
         self._late_prefetches.clear()
 
+        # Safe now: the drain above resolved every submitted bundle through
+        # on_promotion_finished(), so only unsubmitted state remains.
+        if self._prefetch_policy is not None:
+            self._prefetch_policy.reset()
+
         # Deferred promotion submissions reserve primary slots that the
         # reset below invalidates; their submit_load() has not yet been
         # called so no tier I/O is touching that memory.
@@ -1043,6 +1189,14 @@ class TieringOffloadingManager(OffloadingManager):
                 stats = tier_stats
             else:
                 stats.aggregate(tier_stats)
+
+        if self._prefetch_policy is not None:
+            policy_stats = self._prefetch_policy.get_stats()
+            if policy_stats is not None and not policy_stats.is_empty():
+                if stats is None:
+                    stats = policy_stats
+                else:
+                    stats.aggregate(policy_stats)
 
         if not self._stats.is_empty():
             if stats is None:
