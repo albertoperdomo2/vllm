@@ -3,6 +3,7 @@
 """Unit tests for AsyncLookupManager."""
 
 import threading
+import time
 from collections.abc import Iterable
 
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext, make_offload_key
@@ -33,7 +34,89 @@ class InMemoryLookupManager(AsyncLookupManager):
         return results
 
 
+class ControlledLookupManager(AsyncLookupManager):
+    """Lookup worker whose first speculative request can be held in flight."""
+
+    def __init__(self):
+        super().__init__(tier_type="controlled")
+        self.release_blocker = threading.Event()
+        self.called: dict[str, threading.Event] = {}
+        self.call_order: list[str] = []
+        self.call_lock = threading.Lock()
+
+    def event(self, req_id: str) -> threading.Event:
+        return self.called.setdefault(req_id, threading.Event())
+
+    def batch_lookup(
+        self, keys: list[OffloadKey], req_context: ReqContext
+    ) -> Iterable[bool]:
+        with self.call_lock:
+            self.call_order.append(req_context.req_id)
+        self.event(req_context.req_id).set()
+        if req_context.req_id == "blocker":
+            self.release_blocker.wait(timeout=5.0)
+        return [True] * len(keys)
+
+
+def _wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
 class TestAsyncLookupManager:
+    def test_demand_bypasses_queued_prefetch_batch(self):
+        mgr = ControlledLookupManager()
+        try:
+            mgr.lookup_prefetch(_key(1), _ctx("blocker"))
+            mgr.flush()
+            assert mgr.event("blocker").wait(timeout=5.0)
+
+            mgr.lookup_prefetch(_key(2), _ctx("prefetch"))
+            mgr.flush()
+            mgr.lookup(_key(3), _ctx("demand"))
+            mgr.flush()
+
+            mgr.release_blocker.set()
+            assert mgr.event("demand").wait(timeout=5.0)
+            assert mgr.event("prefetch").wait(timeout=5.0)
+            assert mgr.call_order[:3] == ["blocker", "demand", "prefetch"]
+        finally:
+            mgr.release_blocker.set()
+            mgr.shutdown()
+
+    def test_cleanup_skips_queued_prefetch_lookup(self):
+        mgr = ControlledLookupManager()
+        try:
+            mgr.lookup_prefetch(_key(1), _ctx("blocker"))
+            mgr.flush()
+            assert mgr.event("blocker").wait(timeout=5.0)
+
+            mgr.lookup_prefetch(_key(2), _ctx("cancelled"))
+            mgr.flush()
+            mgr.cleanup("cancelled")
+            mgr.lookup(_key(3), _ctx("demand"))
+            mgr.flush()
+
+            mgr.release_blocker.set()
+            assert mgr.event("demand").wait(timeout=5.0)
+
+            def worker_idle():
+                with mgr._work_lock:
+                    return (
+                        sum(mgr._queued_batches.values()) == 0
+                        and mgr._inflight_priority is None
+                    )
+
+            assert _wait_until(worker_idle)
+            assert "cancelled" not in mgr.call_order
+        finally:
+            mgr.release_blocker.set()
+            mgr.shutdown()
+
     def test_new_key_returns_none(self):
         mgr = InMemoryLookupManager()
         assert mgr.lookup(_key(1), _ctx()) is None

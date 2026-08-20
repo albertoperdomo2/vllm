@@ -204,6 +204,19 @@ class FileSystemTierManager(SecondaryTierManager):
         return LookupResult.HIT if result else LookupResult.MISS
 
     @override
+    def lookup_prefetch(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        result = self._lookup_manager.lookup_prefetch(key, req_context)
+        if result is None:
+            return LookupResult.RETRY
+        return LookupResult.HIT if result else LookupResult.MISS
+
+    @override
+    def prefetch_demand_idle(self) -> bool:
+        return not (
+            self._lookup_manager.has_demand_work() or self._pool.has_demand_load_work()
+        )
+
+    @override
     def submit_store(self, job_metadata: JobMetadata) -> None:
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
@@ -228,7 +241,12 @@ class FileSystemTierManager(SecondaryTierManager):
             self._use_o_direct,
         )
 
-        self._pool.enqueue_load(job_metadata.job_id, 1, [task])
+        self._pool.enqueue_load(
+            job_metadata.job_id,
+            1,
+            [task],
+            is_prefetch=job_metadata.is_prefetch,
+        )
 
     @override
     def get_finished_jobs(self) -> Iterable[JobResult]:

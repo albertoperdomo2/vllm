@@ -28,6 +28,7 @@ _bundle_deadline = operator.attrgetter("deadline")
 
 
 class BundleState(enum.Enum):
+    QUEUED = enum.auto()
     PENDING_LOOKUP = enum.auto()
     RESIDENT = enum.auto()
     # Some keys submitted, more of the resolved run still to go. Non-terminal
@@ -134,6 +135,8 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
         self._submitted_key_owner: dict[OffloadKey, str] = {}
         self._estimator = LeadTimeEstimator(config)
         self._tier_label = host.prefetch_tier_label(config.tier_idx)
+        self._owner_req_id: str | None = None
+        self._owner_deadline: float | None = None
 
     # ------------------------------------------------------------------
     # Accounting helpers
@@ -177,8 +180,34 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
             labelvalues=(f"{old_state.name.lower()}->{new_state.name.lower()}",),
         )
         if new_state in _TERMINAL_STATES:
+            if self.config.jit_activation and new_state is not BundleState.READY:
+                self._release_owner(
+                    bundle.req_id, reason=f"terminal_{new_state.name.lower()}"
+                )
             self._active.pop(bundle.req_id, None)
             del self._bundles[bundle.req_id]
+
+    def _release_owner(
+        self,
+        req_id: str,
+        *,
+        demanded: bool = False,
+        reason: str = "terminal",
+    ) -> None:
+        if self._owner_req_id != req_id:
+            return
+        self.host.prefetch_release_owner(req_id, demanded=demanded)
+        self._stats.increase_counter(
+            AdmissionPrefetchMetrics.OWNER_RELEASES,
+            labelvalues=(self._tier_label[0], reason),
+        )
+        self._owner_req_id = None
+        self._owner_deadline = None
+        self._stats.set_gauge(
+            AdmissionPrefetchMetrics.ACTIVE_OWNER,
+            0.0,
+            labelvalues=self._tier_label,
+        )
 
     def _pending_key_count(self, bundle: Bundle) -> int:
         """Window keys with an issued but unresolved residency lookup.
@@ -225,8 +254,15 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
         would orphan its _submitted_key_owner entries. The per-key partition
         closes now; the bundle-level outcome waits for the in-flight keys.
         """
-        self._close_resolved(bundle, terminal_counter)
-        self._close_pending(bundle)
+        if bundle.state is BundleState.QUEUED:
+            # JIT admission has issued no lookup yet, so cancellation or a
+            # pre-gate rejection owns the whole bundle. Calling these keys
+            # unresolved would incorrectly attribute work that never started.
+            self._finalize_keys(terminal_counter, len(bundle.keys) - bundle.cursor)
+            bundle.cursor = len(bundle.keys)
+        else:
+            self._close_resolved(bundle, terminal_counter)
+            self._close_pending(bundle)
         if bundle.outstanding:
             bundle.abandoned_outcome = outcome
             self._set_state(bundle, BundleState.SUBMITTED)
@@ -332,10 +368,13 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
             admitted_at=queued.admitted_at,
             lead_time_ms=lead_time_ms,
         )
+        if self.config.jit_activation:
+            bundle.state = BundleState.QUEUED
         self._bundles[req_id] = bundle
         self._active[req_id] = None
-        for key in bundle.keys:
-            self.host.prefetch_secondary_lookup(bundle.tier_idx, key, req_context)
+        if not self.config.jit_activation:
+            for key in bundle.keys:
+                self.host.prefetch_secondary_lookup(bundle.tier_idx, key, req_context)
 
     def step(self, context: ScheduleEndContext) -> None:
         now = self.clock()
@@ -350,10 +389,11 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
                         AdmissionPrefetchMetrics.ACTUAL_LEAD_TIME,
                         max(0.0, now - queued.admitted_at),
                     )
+            self._release_owner(req_id, demanded=True, reason="scheduled")
             bundle = self._bundles.get(req_id)
-            if bundle is not None and bundle.state is not BundleState.SUBMITTED:
+            if bundle is not None:
                 # First demand ran during this step's scheduling pass, so
-                # any unsubmitted bundle missed its window.
+                # any unfinished bundle missed its overlap window.
                 self._late(bundle)
 
         self._estimator.on_first_scheduled(
@@ -364,23 +404,111 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
 
         for req_id in context.preempted_req_ids:
             bundle = self._bundles.get(req_id)
-            if bundle is not None and bundle.state is not BundleState.SUBMITTED:
+            self._release_owner(req_id, reason="preempted")
+            if bundle is not None:
                 self._cancel(bundle, "cancelled_preempted")
 
-        # Earliest deadline first. Admission order would hand the budget to the
-        # requests closest to being scheduled -- the ones with the least lead
-        # time and so the least to gain -- and make the bundles that can still
-        # be hidden wait behind them.
+        if (
+            self.config.jit_activation
+            and self._owner_req_id is not None
+            and self._owner_deadline is not None
+            and now >= self._owner_deadline
+        ):
+            owner_req_id = self._owner_req_id
+            bundle = self._bundles.get(owner_req_id)
+            self._release_owner(owner_req_id, reason="expired")
+            if bundle is not None:
+                self._late(bundle)
+
+        activated_req_id = None
+        if self.config.jit_activation and self._owner_req_id is None:
+            activated_req_id = self._activate_next_bundle(now)
+
+        # Earliest deadline first keeps JIT residency close to demand and avoids
+        # retaining a farther-future request while an earlier one waits.
         drivable = [
             bundle
             for bundle in (self._bundles.get(req_id) for req_id in self._active)
-            if bundle is not None and bundle.state is not BundleState.SUBMITTED
+            if bundle is not None
+            and bundle.state not in (BundleState.QUEUED, BundleState.SUBMITTED)
+            and bundle.req_id != activated_req_id
+            and (not self.config.jit_activation or bundle.req_id == self._owner_req_id)
         ]
         drivable.sort(key=_bundle_deadline)
 
         step_key_budget = self.config.max_promotions_per_step
         for bundle in drivable:
             step_key_budget = self._drive_bundle(bundle, now, step_key_budget)
+        self._stats.set_gauge(
+            AdmissionPrefetchMetrics.ACTIVE_OWNER,
+            1.0 if self._owner_req_id is not None else 0.0,
+            labelvalues=self._tier_label,
+        )
+
+    def _activate_next_bundle(self, now: float) -> str | None:
+        queued = [
+            bundle
+            for bundle in self._bundles.values()
+            if bundle.state is BundleState.QUEUED
+        ]
+        if not queued:
+            return None
+        if not self.host.prefetch_speculation_idle(self.config.tier_idx):
+            self._stats.increase_counter(
+                AdmissionPrefetchMetrics.ACTIVATION_DEFERRED,
+                labelvalues=(self._tier_label[0], "speculation_busy"),
+            )
+            return None
+        if self.config.demand_idle_only and not self.host.prefetch_demand_idle(
+            self.config.tier_idx
+        ):
+            self._stats.increase_counter(
+                AdmissionPrefetchMetrics.ACTIVATION_DEFERRED,
+                labelvalues=(self._tier_label[0], "demand_busy"),
+            )
+            return None
+
+        bundle = min(queued, key=_bundle_deadline)
+        h_remaining_ms = (bundle.deadline - now) * 1000.0
+        if h_remaining_ms <= 0:
+            self._late(bundle)
+            return None
+        prefetch_latency_ms = self.host.prefetch_transfer_cost_ms(
+            bundle.tier_idx, len(bundle.keys)
+        )
+        if h_remaining_ms <= prefetch_latency_ms:
+            self._stats.observe_histogram(
+                AdmissionPrefetchMetrics.DEADLINE_MARGIN,
+                (h_remaining_ms - prefetch_latency_ms) / 1000.0,
+            )
+            self._gate_reject(bundle, "gate_reject_jit_deadline")
+            return None
+
+        self._owner_req_id = bundle.req_id
+        self._owner_deadline = bundle.deadline
+        self._stats.set_gauge(
+            AdmissionPrefetchMetrics.ACTIVE_OWNER,
+            1.0,
+            labelvalues=self._tier_label,
+        )
+        self._set_state(bundle, BundleState.PENDING_LOOKUP)
+        results = []
+        for key in bundle.keys:
+            results.append(
+                self.host.prefetch_secondary_lookup(
+                    bundle.tier_idx, key, bundle.req_context
+                )
+            )
+        for result in results:
+            if result is LookupResult.HIT:
+                bundle.resolved_run += 1
+            elif result is LookupResult.MISS:
+                self._finalize_keys(AdmissionPrefetchMetrics.SECONDARY_ABSENT, 1)
+                bundle.absent_found = True
+                break
+            else:
+                break
+        return bundle.req_id
 
     def _drive_bundle(self, bundle: Bundle, now: float, key_budget: int) -> int:
         """Re-drive one bundle; returns the remaining per-step key budget."""
@@ -427,6 +555,14 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
         # resolves as LATE.
         remaining = bundle.resolved_run - bundle.cursor
         if key_budget <= 0:
+            return key_budget
+        if self.config.jit_activation and bundle.outstanding:
+            return key_budget
+        if (
+            self.config.jit_activation
+            and self.config.demand_idle_only
+            and not self.host.prefetch_demand_idle(bundle.tier_idx)
+        ):
             return key_budget
         bundle_len = min(remaining, key_budget)
         # Cost is measured from real promotions on this tier, so a busy tier
@@ -550,6 +686,7 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
             if bundle.cursor < bundle.resolved_run:
                 # A slice landed but the bundle still has run left to submit;
                 # it stays drivable rather than terminalizing early.
+                self._set_state(bundle, BundleState.SUBMITTING)
                 continue
             if bundle.abandoned_outcome is not None:
                 # Cancelled or late while keys were still moving; its per-key
@@ -558,6 +695,7 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
                 self._set_state(bundle, BundleState.CANCELLED)
             elif bundle.any_load_failed:
                 self._bundle_outcome("failed")
+                self._release_owner(bundle.req_id, reason="promotion_failed")
                 self._set_state(bundle, BundleState.FAILED)
             elif bundle.demanded_while_pending:
                 self._bundle_outcome("late")
@@ -571,19 +709,22 @@ class AdmissionPrefetchPolicy(PrefetchPolicy):
         if not self._admitted_unscheduled:
             self._estimator.on_queue_idle()
         bundle = self._bundles.get(req_id)
-        if bundle is not None and bundle.state is not BundleState.SUBMITTED:
+        self._release_owner(req_id, reason="finished")
+        if bundle is not None:
             # Removing the bundle guarantees no further lookups are issued
             # for this request, so the tier's AsyncLookupManager cleanup
             # cannot be repopulated after it runs.
             self._cancel(bundle, "cancelled_finished")
 
     def has_pending_work(self) -> bool:
-        return bool(self._active)
+        return bool(self._active) or self._owner_req_id is not None
 
     def reset(self) -> None:
         assert not self._submitted_key_owner, (
             "reset() requires all submitted promotions to be drained first"
         )
+        if self._owner_req_id is not None:
+            self._release_owner(self._owner_req_id, reason="reset")
         for req_id in list(self._active):
             bundle = self._bundles.get(req_id)
             if bundle is not None:

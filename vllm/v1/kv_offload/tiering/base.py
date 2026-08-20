@@ -65,6 +65,7 @@ class JobMetadata:
     block_ids: np.ndarray
     is_promotion: bool
     req_context: ReqContext
+    is_prefetch: bool = False
 
 
 @dataclass
@@ -161,6 +162,18 @@ class SecondaryTierManager(ABC):
             or RETRY if the block is being transferred (retry later).
         """
         pass
+
+    def lookup_prefetch(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        """Low-priority lookup for speculative work.
+
+        Tiers without priority-aware lookup scheduling retain their existing
+        behavior. Priority-aware tiers override this method.
+        """
+        return self.lookup(key, req_context)
+
+    def prefetch_demand_idle(self) -> bool:
+        """Whether this tier has no queued or active demand read work."""
+        return True
 
     @abstractmethod
     def submit_store(self, job_metadata: JobMetadata) -> None:

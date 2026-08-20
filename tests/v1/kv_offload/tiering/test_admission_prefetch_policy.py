@@ -59,6 +59,9 @@ class FakeHost:
         self.primary_lookups = []
         self.secondary_lookups = []
         self.submits = []
+        self.demand_idle = True
+        self.speculation_idle = True
+        self.released_owners = []
         # Keys the next submit should report as redundant/capacity-skipped.
         self.submit_redundant = set()
         self.submit_capacity_skipped = set()
@@ -78,6 +81,12 @@ class FakeHost:
     def prefetch_tier_allowed(self, tier_idx, req_context):
         return self.tier_allowed
 
+    def prefetch_demand_idle(self, tier_idx):
+        return self.demand_idle
+
+    def prefetch_speculation_idle(self, tier_idx):
+        return self.speculation_idle
+
     def prefetch_tier_label(self, tier_idx):
         return TIER_LABEL
 
@@ -96,6 +105,9 @@ class FakeHost:
             else:
                 result.submitted.append(key)
         return result
+
+    def prefetch_release_owner(self, req_id, *, demanded=False):
+        self.released_owners.append((req_id, demanded))
 
 
 def make_policy(host=None, clock=None, **config_kwargs):
@@ -156,6 +168,105 @@ def resolve_all(host, keys, result=LookupResult.HIT):
 
 def empty_step():
     return ScheduleEndContext(new_req_ids=(), preempted_req_ids=())
+
+
+class TestJITActivation:
+    def test_admission_defers_secondary_lookup_until_step(self):
+        policy, host, _ = make_policy(jit_activation=True)
+        keys = to_keys(3)
+
+        admit(policy, host, "r0", keys)
+
+        assert host.secondary_lookups == []
+        assert policy._bundles["r0"].state is BundleState.QUEUED
+
+        policy.step(empty_step())
+
+        assert host.secondary_lookups == keys
+        assert policy._bundles["r0"].state is BundleState.PENDING_LOOKUP
+
+    def test_demand_work_delays_activation(self):
+        policy, host, _ = make_policy(jit_activation=True)
+        keys = to_keys(2)
+        host.demand_idle = False
+        admit(policy, host, "r0", keys)
+
+        policy.step(empty_step())
+        assert host.secondary_lookups == []
+
+        host.demand_idle = True
+        policy.step(empty_step())
+        assert host.secondary_lookups == keys
+        deferred = policy._stats._values[AdmissionPrefetchMetrics.ACTIVATION_DEFERRED]
+        assert deferred[(TIER_LABEL[0], "demand_busy")] == 1
+
+    def test_existing_speculative_io_delays_activation(self):
+        policy, host, _ = make_policy(jit_activation=True)
+        keys = to_keys(2)
+        host.speculation_idle = False
+        admit(policy, host, "r0", keys)
+
+        policy.step(empty_step())
+
+        assert host.secondary_lookups == []
+        deferred = policy._stats._values[AdmissionPrefetchMetrics.ACTIVATION_DEFERRED]
+        assert deferred[(TIER_LABEL[0], "speculation_busy")] == 1
+
+    def test_one_owner_blocks_new_bundle_until_first_schedule(self):
+        policy, host, _ = make_policy(
+            jit_activation=True,
+            max_bundle_chunks=3,
+            max_promotions_per_step=3,
+        )
+        first = to_keys(3, prefix="first")
+        second = to_keys(3, prefix="second")
+        resolve_all(host, first + second)
+
+        fill_queue(policy, 3)
+        first_ctx = ReqContext(req_id="r0", kv_transfer_params=None)
+        policy.on_request_enqueued(first_ctx)
+        policy.on_request_admitted(first_ctx, first)
+        second_ctx = ReqContext(req_id="r1", kv_transfer_params=None)
+        policy.on_request_enqueued(second_ctx)
+        policy.on_request_admitted(second_ctx, second)
+
+        policy.step(empty_step())
+        assert host.submits == []
+        assert host.secondary_lookups == first
+
+        policy.step(empty_step())
+        assert host.submits == [first]
+        assert host.secondary_lookups == first
+
+        policy.step(empty_step())
+        assert host.submits == [first]
+        assert host.secondary_lookups == first
+
+        policy.on_promotion_finished(first, success=True)
+        policy.step(empty_step())
+        assert host.submits == [first]
+
+        policy.step(ScheduleEndContext(new_req_ids=("r0",), preempted_req_ids=()))
+        assert host.released_owners[-1] == ("r0", True)
+        releases = policy._stats._values[AdmissionPrefetchMetrics.OWNER_RELEASES]
+        assert releases[(TIER_LABEL[0], "scheduled")] == 1
+        assert host.submits == [first]
+        assert host.secondary_lookups == first + second
+
+        policy.step(empty_step())
+        assert host.submits == [first, second]
+
+    def test_queued_cancellation_is_not_lookup_unresolved(self):
+        policy, host, _ = make_policy(jit_activation=True)
+        keys = to_keys(3)
+        admit(policy, host, "r0", keys)
+
+        policy.on_request_finished("r0")
+
+        assert counter(policy, AdmissionPrefetchMetrics.CANCELLED) == len(keys)
+        assert counter(policy, AdmissionPrefetchMetrics.LOOKUP_UNRESOLVED) == 0
+        assert host.secondary_lookups == []
+        assert_partition(policy)
 
 
 class TestSelection:

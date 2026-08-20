@@ -104,6 +104,11 @@ class CPUOffloadingManager(OffloadingManager):
         # that ends speculative ownership pops from here, so this single
         # ledger cannot drift from reality.
         self._speculative: OrderedDict[OffloadKey, None] = OrderedDict()
+        # JIT mode assigns every speculative allocation to one request. The
+        # active owner is released only when that request reaches demand,
+        # finishes, expires, or fails; a newer request cannot replace it.
+        self._speculative_owner_by_key: dict[OffloadKey, str] = {}
+        self._active_speculative_owner: str | None = None
         # Ready speculative blocks held against ordinary cache persistence for
         # a bounded window, so demand gets a chance to consume them. Without
         # it a promoted copy is the *preferred* eviction victim and is gone
@@ -111,6 +116,7 @@ class CPUOffloadingManager(OffloadingManager):
         # wasted that way. A strict subset of _speculative, insertion-ordered
         # so the oldest lease is released first when the budget is exceeded.
         self._leased: OrderedDict[OffloadKey, None] = OrderedDict()
+        self._lease_owner: str | None = None
         # Blocks the lease may cover. Zero disables retention entirely.
         self._lease_budget: int = 0
         # Blocks held back from demand so speculative work always has headroom.
@@ -276,12 +282,20 @@ class CPUOffloadingManager(OffloadingManager):
         self.mark_demanded(keys)
         self._policy.touch(keys, req_context)
 
-    def mark_speculative(self, keys: Collection[OffloadKey]) -> None:
+    def mark_speculative(
+        self,
+        keys: Collection[OffloadKey],
+        owner_id: str | None = None,
+    ) -> None:
         """Mark ready blocks as reclaimable speculative capacity."""
+        if owner_id is not None and self._active_speculative_owner != owner_id:
+            return
         for key in keys:
             block = self._policy.get(key)
             if block is not None and block.is_ready:
                 self._speculative[key] = None
+                if owner_id is not None:
+                    self._speculative_owner_by_key[key] = owner_id
 
     def mark_demanded(self, keys: Collection[OffloadKey]) -> None:
         """Remove demand-touched blocks from speculative provenance.
@@ -294,6 +308,7 @@ class CPUOffloadingManager(OffloadingManager):
         for key in keys:
             self._leased.pop(key, None)
             self._speculative.pop(key, None)
+            self._speculative_owner_by_key.pop(key, None)
 
     # --- speculative retention lease ---
 
@@ -319,7 +334,11 @@ class CPUOffloadingManager(OffloadingManager):
         self._enforce_lease_budget()
         return self._lease_budget
 
-    def lease_speculative(self, keys: Collection[OffloadKey]) -> None:
+    def lease_speculative(
+        self,
+        keys: Collection[OffloadKey],
+        owner_id: str | None = None,
+    ) -> bool:
         """Retain ready speculative blocks against ordinary persistence.
 
         Only ready blocks that are still speculative are eligible: a block
@@ -327,19 +346,78 @@ class CPUOffloadingManager(OffloadingManager):
         data and must not be re-marked.
         """
         if self._lease_budget <= 0:
-            return
+            return False
+        if owner_id is not None:
+            if self._active_speculative_owner != owner_id:
+                return False
+            if self._lease_owner not in (None, owner_id):
+                return False
+            if self._lease_owner is None and self._leased:
+                return False
+
+        eligible: list[OffloadKey] = []
         for key in keys:
             if key not in self._speculative:
                 continue
+            if (
+                owner_id is not None
+                and self._speculative_owner_by_key.get(key) != owner_id
+            ):
+                continue
             block = self._policy.get(key)
             if block is not None and block.is_ready:
+                eligible.append(key)
+
+        if owner_id is not None:
+            available = max(0, self._lease_budget - len(self._leased))
+            eligible = eligible[:available]
+            if eligible:
+                self._lease_owner = owner_id
+
+        for key in eligible:
+            if key not in self._leased:
                 self._leased[key] = None
         self._enforce_lease_budget()
+        return bool(eligible)
 
     def release_speculative(self, keys: Collection[OffloadKey]) -> None:
         """Drop the lease, leaving the blocks ordinary speculative capacity."""
         for key in keys:
             self._leased.pop(key, None)
+        if not self._leased:
+            self._lease_owner = None
+
+    def release_speculative_owner(
+        self,
+        owner_id: str,
+        *,
+        demanded: bool = False,
+    ) -> tuple[OffloadKey, ...]:
+        """Release one request's speculative ownership.
+
+        Args:
+            owner_id: Request that owns the speculative bundle.
+            demanded: Convert the owner's blocks to ordinary demand-owned data.
+                False leaves them unleased and reclaimable by later speculation.
+
+        Returns:
+            Keys whose ownership was released, including in-flight keys.
+        """
+        owned = tuple(
+            key
+            for key, key_owner in self._speculative_owner_by_key.items()
+            if key_owner == owner_id
+        )
+        for key in owned:
+            self._leased.pop(key, None)
+            self._speculative_owner_by_key.pop(key, None)
+            if demanded:
+                self._speculative.pop(key, None)
+        if self._lease_owner == owner_id:
+            self._lease_owner = None
+        if self._active_speculative_owner == owner_id:
+            self._active_speculative_owner = None
+        return owned
 
     def _enforce_lease_budget(self) -> None:
         """Release the oldest leases beyond the budget.
@@ -349,7 +427,11 @@ class CPUOffloadingManager(OffloadingManager):
         speculative, so they remain reclaimable -- just no longer protected.
         """
         while len(self._leased) > self._lease_budget:
-            self._leased.popitem(last=False)
+            # A request-owned bundle keeps its earliest prefix blocks. Legacy
+            # anonymous leases retain their historical replacement behavior.
+            self._leased.popitem(last=self._lease_owner is not None)
+        if not self._leased:
+            self._lease_owner = None
 
     def _evict_for_demand(
         self,
@@ -366,10 +448,10 @@ class CPUOffloadingManager(OffloadingManager):
         Speculative blocks are reclaimed first so demand data survives longer.
 
         Args:
-            respect_lease: skip leased speculative blocks. True for ordinary
-                cache persistence, which must not destroy a promoted copy
-                before demand can evaluate it. DEMAND_CRITICAL passes False:
-                a request that is running now outranks retention.
+            respect_lease: skip leased speculative blocks. Demand allocations
+                first pass True so ordinary and unleased victims are exhausted.
+                A critical demand allocation may retry with False only after
+                that protected attempt cannot make progress.
 
         Returns (reclaimed_speculative, normal_victims); a None second element
         means the request cannot be satisfied and nothing has been mutated.
@@ -440,6 +522,7 @@ class CPUOffloadingManager(OffloadingManager):
         req_context: ReqContext,
         *,
         mode: AllocationMode = AllocationMode.DEMAND_CACHE,
+        owner_id: str | None = None,
     ) -> PrepareStoreOutput | None:
         """Allocate primary blocks for the given keys.
 
@@ -452,6 +535,11 @@ class CPUOffloadingManager(OffloadingManager):
                 cannot displace demand data.
         """
         speculative = mode is AllocationMode.SPECULATIVE_ONLY
+        if owner_id is not None:
+            if not speculative:
+                raise ValueError("owner_id is only valid for speculative allocation")
+            if self._active_speculative_owner not in (None, owner_id):
+                return None
         if not speculative:
             # A demand store claims ownership: these keys stop being
             # speculative and stop counting against the reserve.
@@ -506,7 +594,7 @@ class CPUOffloadingManager(OffloadingManager):
                 reclaimed, normal_evicted = self._evict_for_demand(
                     num_blocks_to_evict,
                     protected,
-                    respect_lease=mode is AllocationMode.DEMAND_CACHE,
+                    respect_lease=True,
                 )
                 if normal_evicted is None:
                     if mode is AllocationMode.DEMAND_CACHE:
@@ -556,6 +644,7 @@ class CPUOffloadingManager(OffloadingManager):
             for key, _ in reclaimed:
                 self._policy.remove(key)
                 self._speculative.pop(key, None)
+                self._speculative_owner_by_key.pop(key, None)
                 # Membership, not the popped value: _leased maps to None, so
                 # pop() returns None for a key that was present.
                 if key in self._leased:
@@ -599,6 +688,10 @@ class CPUOffloadingManager(OffloadingManager):
             # tags blocks once they are ready.
             for key in keys_to_store:
                 self._speculative[key] = None
+                if owner_id is not None:
+                    self._speculative_owner_by_key[key] = owner_id
+            if owner_id is not None:
+                self._active_speculative_owner = owner_id
 
         # build store specs for allocated blocks
         store_spec = self._get_load_store_spec(keys_to_store, blocks)
@@ -634,6 +727,7 @@ class CPUOffloadingManager(OffloadingManager):
                     self._num_write_pending_blocks -= 1
                     self._policy.remove(key)
                     self._speculative.pop(key, None)
+                    self._speculative_owner_by_key.pop(key, None)
                     self._leased.pop(key, None)
                     self._free_block(block)
 
@@ -657,7 +751,10 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_evictable_cache_blocks = 0
         self._num_write_pending_blocks = 0
         self._speculative.clear()
+        self._speculative_owner_by_key.clear()
+        self._active_speculative_owner = None
         self._leased.clear()
+        self._lease_owner = None
 
         self._free_list.clear()
         self._num_allocated_blocks = 0

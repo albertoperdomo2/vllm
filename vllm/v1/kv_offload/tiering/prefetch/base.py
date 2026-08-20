@@ -48,6 +48,11 @@ class AdmissionPrefetchMetrics:
     CANCELLED = "vllm:kv_offload_tiering_prefetch_admission_cancelled"
     BUNDLE_OUTCOMES = "vllm:kv_offload_tiering_prefetch_admission_bundle_outcomes"
     TRANSITIONS = "vllm:kv_offload_tiering_prefetch_admission_transitions"
+    ACTIVATION_DEFERRED = (
+        "vllm:kv_offload_tiering_prefetch_admission_activation_deferred"
+    )
+    OWNER_RELEASES = "vllm:kv_offload_tiering_prefetch_admission_owner_releases"
+    ACTIVE_OWNER = "vllm:kv_offload_tiering_prefetch_admission_active_owner"
     BUNDLE_SIZE = "vllm:kv_offload_tiering_prefetch_admission_bundle_chunks"
     DEADLINE_MARGIN = (
         "vllm:kv_offload_tiering_prefetch_admission_deadline_margin_seconds"
@@ -149,6 +154,26 @@ def build_admission_prefetch_metric_definitions(
         documentation="Admission prefetch: bundle state transitions",
         labelnames=("transition",),
     )
+    definitions[AdmissionPrefetchMetrics.ACTIVATION_DEFERRED] = (
+        OffloadingCounterMetadata(
+            documentation=(
+                "Admission prefetch: JIT activation deferred by demand or "
+                "existing speculative work"
+            ),
+            labelnames=("tier", "reason"),
+        )
+    )
+    definitions[AdmissionPrefetchMetrics.OWNER_RELEASES] = OffloadingCounterMetadata(
+        documentation="Admission prefetch: request-owned bundle releases",
+        labelnames=("tier", "reason"),
+    )
+    definitions[AdmissionPrefetchMetrics.ACTIVE_OWNER] = OffloadingGaugeMetadata(
+        documentation=(
+            "Admission prefetch: whether one request currently owns speculative "
+            "lookup, transfer, or retained residency"
+        ),
+        labelnames=("tier",),
+    )
     definitions[AdmissionPrefetchMetrics.LEAD_TIME] = OffloadingHistogramMetadata(
         documentation="Admission prefetch: predicted lead time at admission",
         buckets=_LEAD_TIME_BUCKETS,
@@ -234,6 +259,14 @@ class PrefetchHost(Protocol):
         self, tier_idx: int, key: OffloadKey, req_context: ReqContext
     ) -> LookupResult: ...
 
+    def prefetch_demand_idle(self, tier_idx: int) -> bool:
+        """Whether demand lookup and transfer work is idle on this tier."""
+        ...
+
+    def prefetch_speculation_idle(self, tier_idx: int) -> bool:
+        """Whether no speculative transfer is pending or in flight."""
+        ...
+
     def prefetch_tier_allowed(self, tier_idx: int, req_context: ReqContext) -> bool: ...
 
     def prefetch_tier_label(self, tier_idx: int) -> tuple[str]: ...
@@ -245,6 +278,10 @@ class PrefetchHost(Protocol):
     def prefetch_submit(
         self, tier_idx: int, keys: Sequence[OffloadKey], req_context: ReqContext
     ) -> AdmissionSubmitResult: ...
+
+    def prefetch_release_owner(self, req_id: str, *, demanded: bool = False) -> None:
+        """Release request-owned speculative residency and in-flight ownership."""
+        ...
 
 
 class PrefetchPolicy(ABC):

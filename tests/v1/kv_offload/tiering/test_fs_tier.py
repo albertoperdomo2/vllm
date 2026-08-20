@@ -354,7 +354,8 @@ def test_shutdown_discards_pending_tasks(fs_tier):
     tier.shutdown()
 
     # Verify queues are cleared and threads stopped
-    assert len(tier._pool._load_q) == 0
+    assert len(tier._pool._demand_load_q) == 0
+    assert len(tier._pool._prefetch_load_q) == 0
     assert len(tier._pool._store_q) == 0
     assert all(not t.is_alive() for t in tier._pool._threads)
 
@@ -456,6 +457,35 @@ def test_wait_idle_blocks_until_tasks_complete():
         gate.set()
         pool.shutdown(wait=True)
         waiter.join(timeout=5.0)
+
+
+def test_demand_load_bypasses_queued_prefetch_load():
+    pool = DualQueueThreadPool(n_read_threads=1, n_write_threads=0)
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    order = []
+
+    def blocker():
+        order.append("blocker")
+        blocker_started.set()
+        release_blocker.wait(timeout=5.0)
+
+    try:
+        pool.enqueue_load(1, 1, [blocker], is_prefetch=True)
+        assert blocker_started.wait(timeout=5.0)
+
+        pool.enqueue_load(2, 1, [lambda: order.append("prefetch")], is_prefetch=True)
+        pool.enqueue_load(3, 1, [lambda: order.append("demand")])
+        assert pool.has_demand_load_work()
+
+        release_blocker.set()
+        pool.wait_idle()
+
+        assert order == ["blocker", "demand", "prefetch"]
+        assert not pool.has_demand_load_work()
+    finally:
+        release_blocker.set()
+        pool.shutdown(wait=True)
 
 
 def test_batch_lookup_c_extension(tmp_path):
@@ -817,6 +847,12 @@ def test_admission_prefetch_end_to_end_with_fs_tier(tmp_path):
         prefetch_config=PrefetchConfig(
             enabled=True,
             shadow_mode=False,
+            jit_activation=True,
+            demand_idle_only=True,
+            max_bundle_chunks=2,
+            max_promotions_per_step=2,
+            speculative_reserve_blocks=2,
+            retention_lease_bundles=1,
             initial_admission_interval_ms=10_000.0,
         ),
     )
@@ -848,16 +884,44 @@ def test_admission_prefetch_end_to_end_with_fs_tier(tmp_path):
 
         policy = manager._prefetch_policy
         deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and policy.has_pending_work():
+        while time.monotonic() < deadline and not all(
+            primary.lookup(k, prefetch_ctx) is LookupResult.HIT for k in keys
+        ):
             manager.on_schedule_end(empty)
             time.sleep(0.01)
 
         stats = policy._stats._values
         submitted = stats.get(AdmissionPrefetchMetrics.SUBMITTED, {})
         assert sum(submitted.values()) == len(keys)
+        assert primary._active_speculative_owner == "prefetcher"
+        assert primary._lease_owner == "prefetcher"
+        assert set(primary._leased) == set(keys)
+
+        # Fill the ordinary demand share, then force another persistence store
+        # to choose victims. The request-owned bundle must survive this pressure.
+        pressure_ctx = _ReqContext(req_id="pressure")
+        manager.on_new_request(pressure_ctx)
+        first_pressure = [key(i) for i in range(10, 16)]
+        first_store = manager.prepare_store(first_pressure, pressure_ctx)
+        assert first_store is not None
+        manager.complete_store(first_store.keys_to_store, pressure_ctx)
+        tier.drain_jobs()
+        manager.on_schedule_end(empty)
+
+        second_pressure = [key(16), key(17)]
+        second_store = manager.prepare_store(second_pressure, pressure_ctx)
+        assert second_store is not None
+        manager.complete_store(second_store.keys_to_store, pressure_ctx)
 
         # The promoted copies are what a later demand lookup would consume.
         for k in keys:
-            assert primary.lookup(k, prefetch_ctx) is LookupResult.HIT
+            assert manager.lookup(k, prefetch_ctx) is LookupResult.HIT
+
+        manager.on_schedule_end(
+            ScheduleEndContext(new_req_ids=("prefetcher",), preempted_req_ids=())
+        )
+        assert primary._active_speculative_owner is None
+        assert primary._lease_owner is None
+        assert not primary._leased
     finally:
         tier.shutdown()

@@ -226,6 +226,10 @@ class TieringOffloadingManager(OffloadingManager):
         self._inflight_prefetches: dict[OffloadKey, int] = {}
         self._pending_untracked_prefetches: dict[OffloadKey, int] = {}
         self._demanded_prefetches: set[OffloadKey] = set()
+        # A request may schedule or finish while its speculative transfer is
+        # still in flight. Completion must not recreate ownership or a lease
+        # after that lifecycle boundary.
+        self._released_prefetch_owners: set[str] = set()
 
         if self._admission_prefetch_chunks > 0 and not self.secondary_tiers:
             raise ValueError(
@@ -301,7 +305,9 @@ class TieringOffloadingManager(OffloadingManager):
         #   False: primary → secondary (cascade)
         self._transfer_jobs: dict[JobId, JobMetadata] = {}
 
-        self._prefetch_job_keys: dict[JobId, tuple[int, tuple[OffloadKey, ...]]] = {}
+        self._prefetch_job_keys: dict[
+            JobId, tuple[int, tuple[OffloadKey, ...], str | None]
+        ] = {}
 
         # Pending promotion requests accumulated during lookup() calls; flushed
         # as one batched submit_load() per (tier, request) in on_schedule_end().
@@ -392,7 +398,7 @@ class TieringOffloadingManager(OffloadingManager):
                     )
 
                     if prefetch_job is not None:
-                        tier_idx, prefetch_keys = prefetch_job
+                        tier_idx, prefetch_keys, owner_id = prefetch_job
                         if not completed_job.success:
                             self._stats.increase_counter(
                                 TieringOffloadingMetrics.PREFETCH_LOAD_FAILED,
@@ -402,19 +408,23 @@ class TieringOffloadingManager(OffloadingManager):
                             for key in prefetch_keys:
                                 self._prefetched.pop(key, None)
                                 self._late_prefetches.discard(key)
-                        else:
+                        elif owner_id not in self._released_prefetch_owners:
                             speculative_keys = tuple(
                                 key
                                 for key in prefetch_keys
                                 if key not in self._demanded_prefetches
                             )
-                            self.primary_tier.mark_speculative(speculative_keys)
+                            self.primary_tier.mark_speculative(
+                                speculative_keys, owner_id=owner_id
+                            )
                             # Retain the freshly promoted copy so ordinary
                             # cache persistence cannot take it before the
                             # queued request arrives. Keys demand already
                             # claimed in flight are excluded above: they are
                             # ordinary data and need no retention.
-                            self.primary_tier.lease_speculative(speculative_keys)
+                            self.primary_tier.lease_speculative(
+                                speculative_keys, owner_id=owner_id
+                            )
 
                         for key in prefetch_keys:
                             self._inflight_prefetches.pop(key, None)
@@ -431,6 +441,11 @@ class TieringOffloadingManager(OffloadingManager):
                             self._prefetch_policy.on_promotion_finished(
                                 prefetch_keys, completed_job.success
                             )
+                        if owner_id is not None and not any(
+                            job_owner == owner_id
+                            for _, _, job_owner in self._prefetch_job_keys.values()
+                        ):
+                            self._released_prefetch_owners.discard(owner_id)
                 else:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary blocks.
@@ -550,7 +565,42 @@ class TieringOffloadingManager(OffloadingManager):
         May return RETRY while the tier's batched async lookup is pending;
         the policy keeps the bundle pending and re-drives on later steps.
         """
-        return self.secondary_tiers[tier_idx].lookup(key, req_context)
+        return self.secondary_tiers[tier_idx].lookup_prefetch(key, req_context)
+
+    def prefetch_demand_idle(self, tier_idx: int) -> bool:
+        tier = self.secondary_tiers[tier_idx]
+        pending = self._pending_load_submissions.get(tier, {})
+        if any(
+            len(entry.prefetch_keys) < len(entry.keys) for entry in pending.values()
+        ):
+            return False
+        return tier.prefetch_demand_idle()
+
+    def prefetch_speculation_idle(self, tier_idx: int) -> bool:
+        if any(
+            job_tier_idx == tier_idx
+            for job_tier_idx, _, _ in self._prefetch_job_keys.values()
+        ):
+            return False
+        tier = self.secondary_tiers[tier_idx]
+        return not any(
+            entry.prefetch_keys
+            for entry in self._pending_load_submissions.get(tier, {}).values()
+        )
+
+    def prefetch_release_owner(self, req_id: str, *, demanded: bool = False) -> None:
+        has_future_completion = any(
+            job_owner == req_id for _, _, job_owner in self._prefetch_job_keys.values()
+        ) or any(
+            entry.req_context.req_id == req_id and entry.prefetch_keys
+            for pending in self._pending_load_submissions.values()
+            for entry in pending.values()
+        )
+        if has_future_completion:
+            self._released_prefetch_owners.add(req_id)
+        else:
+            self._released_prefetch_owners.discard(req_id)
+        self.primary_tier.release_speculative_owner(req_id, demanded=demanded)
 
     def prefetch_submit(
         self,
@@ -585,6 +635,12 @@ class TieringOffloadingManager(OffloadingManager):
                 req_context,
                 is_prefetch=True,
                 mode=AllocationMode.SPECULATIVE_ONLY,
+                speculative_owner=(
+                    req_context.req_id
+                    if self._prefetch_policy is not None
+                    and self._prefetch_policy.config.jit_activation
+                    else None
+                ),
             ):
                 result.submitted.append(key)
                 self._stats.increase_counter(
@@ -812,6 +868,7 @@ class TieringOffloadingManager(OffloadingManager):
         *,
         is_prefetch: bool = False,
         mode: AllocationMode = AllocationMode.DEMAND_CRITICAL,
+        speculative_owner: str | None = None,
     ) -> bool:
         """
         Queue a block for promotion from a secondary tier to the primary tier.
@@ -838,7 +895,7 @@ class TieringOffloadingManager(OffloadingManager):
         # for this key on any subsequent lookup() call within the same step,
         # preventing duplicate promotion attempts.
         primary_write_result = self.primary_tier.prepare_write(
-            [key], req_context, mode=mode
+            [key], req_context, mode=mode, owner_id=speculative_owner
         )
 
         if primary_write_result is None:
@@ -889,6 +946,10 @@ class TieringOffloadingManager(OffloadingManager):
                     block_ids=np.array(entry.block_ids, dtype=np.int64),
                     is_promotion=True,
                     req_context=entry.req_context,
+                    is_prefetch=(
+                        bool(entry.prefetch_keys)
+                        and len(entry.prefetch_keys) == len(entry.keys)
+                    ),
                 )
                 self._transfer_jobs[job_id] = job_metadata
 
@@ -897,6 +958,12 @@ class TieringOffloadingManager(OffloadingManager):
                     self._prefetch_job_keys[job_id] = (
                         tier_idx,
                         tuple(entry.prefetch_keys),
+                        (
+                            entry.req_context.req_id
+                            if self._prefetch_policy is not None
+                            and self._prefetch_policy.config.jit_activation
+                            else None
+                        ),
                     )
 
                 if self._promotion_timings:
@@ -1155,6 +1222,7 @@ class TieringOffloadingManager(OffloadingManager):
                     state.request_level_tiers = set()
                 state.request_level_tiers.add(tier)
         self._req_state[req_context.req_id] = state
+        self._released_prefetch_owners.discard(req_context.req_id)
         if self._prefetch_policy is not None and exclude_tier is None:
             self._prefetch_policy.on_request_enqueued(req_context)
 
@@ -1314,6 +1382,7 @@ class TieringOffloadingManager(OffloadingManager):
         self._pending_untracked_prefetches.clear()
         self._inflight_prefetches.clear()
         self._demanded_prefetches.clear()
+        self._released_prefetch_owners.clear()
 
         # Safe now: the drain above resolved every submitted bundle through
         # on_promotion_finished(), so only unsubmitted state remains.

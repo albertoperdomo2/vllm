@@ -176,6 +176,107 @@ class Harness:
         assert considered == terminal
 
 
+class TestJITManagerPath:
+    def test_admission_does_not_probe_or_submit_immediately(self):
+        h = Harness(jit_activation=True, max_bundle_chunks=2)
+        keys = to_keys([1, 2])
+        h.tier.resolve(keys)
+
+        h.admit("r0", keys)
+
+        assert h.tier.lookup_calls == []
+        assert h.tier.pending_jobs == []
+
+        h.step()
+        assert h.tier.lookup_calls == keys
+        assert h.tier.pending_jobs == []
+
+    def test_one_inflight_bundle_is_retained_until_owner_schedules(self):
+        h = Harness(
+            num_blocks=32,
+            jit_activation=True,
+            max_bundle_chunks=2,
+            max_promotions_per_step=2,
+            speculative_reserve_blocks=8,
+            retention_lease_bundles=1,
+        )
+        h.tier.autocomplete = False
+        first = to_keys([1, 2])
+        second = to_keys([3, 4])
+        h.tier.resolve(first + second)
+        h.admit("r0", first)
+        h.admit("r1", second)
+
+        h.step()
+        assert h.tier.lookup_calls == first
+        h.step()
+        assert len(h.tier.pending_jobs) == 1
+        assert h.tier.pending_jobs[0].keys == first
+        assert h.tier.pending_jobs[0].is_prefetch
+
+        h.step()
+        assert len(h.tier.pending_jobs) == 1
+        assert h.tier.lookup_calls == first
+
+        h.tier.complete_pending()
+        h.step()
+        assert h.primary._active_speculative_owner == "r0"
+        assert h.primary._lease_owner == "r0"
+        assert set(h.primary._leased) == set(first)
+        assert h.tier.lookup_calls == first
+
+        h.step(new_req_ids=("r0",))
+        assert h.policy._owner_req_id == "r1"
+        assert h.primary._active_speculative_owner is None
+        assert h.primary._lease_owner is None
+        assert not h.primary._leased
+        assert h.tier.lookup_calls == first + second
+
+        h.step()
+        assert h.primary._active_speculative_owner == "r1"
+        assert len(h.tier.pending_jobs) == 1
+        assert h.tier.pending_jobs[0].keys == second
+
+    def test_cancelled_inflight_owner_is_not_released_back_into_a_lease(self):
+        h = Harness(
+            num_blocks=32,
+            jit_activation=True,
+            max_bundle_chunks=2,
+            max_promotions_per_step=2,
+            speculative_reserve_blocks=8,
+            retention_lease_bundles=1,
+        )
+        h.tier.autocomplete = False
+        keys = to_keys([1, 2])
+        second = to_keys([3, 4])
+        h.tier.resolve(keys + second)
+        ctx = h.admit("r0", keys)
+        h.admit("r1", second)
+
+        h.step()
+        h.step()
+        assert h.primary._active_speculative_owner == "r0"
+        assert len(h.tier.pending_jobs) == 1
+
+        h.manager.on_request_finished(ctx)
+        assert h.primary._active_speculative_owner is None
+        assert h.primary._lease_owner is None
+
+        h.step()
+        assert h.policy._owner_req_id is None
+        assert h.tier.lookup_calls == keys
+
+        h.tier.complete_pending()
+        h.step()
+
+        assert h.policy._owner_req_id == "r1"
+        assert h.tier.lookup_calls == keys + second
+        assert h.primary._active_speculative_owner is None
+        assert h.primary._lease_owner is None
+        assert not h.primary._leased
+        assert h.bundle_outcome("cancelled_finished") == 1
+
+
 class TestSubmission:
     def test_resident_bundle_is_submitted_and_promoted(self):
         h = Harness()

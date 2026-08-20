@@ -1351,14 +1351,19 @@ def test_capacity_gauges_distinguish_fill_from_pinned_occupancy():
     assert gauges[CPUOffloadingMetrics.CPU_CACHE_EVICTABLE_BLOCKS][()] == 4
 
 
-def _promote_and_lease(manager, key_ids, ctx=_EMPTY_REQ_CTX):
+def _promote_and_lease(manager, key_ids, ctx=_EMPTY_REQ_CTX, owner_id=None):
     """Land a ready speculative bundle and retain it, as a promotion does."""
     keys = to_keys(key_ids)
-    output = manager.prepare_store(keys, ctx, mode=AllocationMode.SPECULATIVE_ONLY)
+    output = manager.prepare_store(
+        keys,
+        ctx,
+        mode=AllocationMode.SPECULATIVE_ONLY,
+        owner_id=owner_id,
+    )
     assert output is not None
     manager.complete_store(output.keys_to_store, ctx)
-    manager.mark_speculative(keys)
-    manager.lease_speculative(keys)
+    manager.mark_speculative(keys, owner_id=owner_id)
+    manager.lease_speculative(keys, owner_id=owner_id)
     return keys
 
 
@@ -1387,25 +1392,58 @@ def test_lease_retains_promoted_blocks_against_cache_persistence():
         )
 
 
-def test_critical_demand_may_break_a_lease_and_records_it():
-    """Retention never outranks a request that is running now."""
+def test_critical_demand_evicts_ordinary_blocks_before_a_lease():
     manager = make_cpu_manager(num_blocks=8, speculative_reserve_blocks=2)
     manager.set_lease_budget(2)
-    key_id, _ = _fill_with_demand(manager, 0, batches=4, batch_size=2)
+    demand = to_keys(list(range(6)))
+    manager.complete_store(
+        manager.prepare_store(demand, _EMPTY_REQ_CTX).keys_to_store, _EMPTY_REQ_CTX
+    )
     promoted = _promote_and_lease(manager, [9000, 9001])
 
-    _fill_with_demand(
-        manager, key_id, batches=4, batch_size=2, mode=AllocationMode.DEMAND_CRITICAL
+    output = manager.prepare_store(
+        to_keys([10000, 10001]),
+        _EMPTY_REQ_CTX,
+        mode=AllocationMode.DEMAND_CRITICAL,
     )
 
+    assert output is not None
+    assert set(output.evicted_keys).issubset(set(demand))
+    assert all(
+        manager.lookup(key, _EMPTY_REQ_CTX) is LookupResult.HIT for key in promoted
+    )
+    counters = manager.get_stats()._values.get(
+        CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_LEASE_RECLAIMED_BLOCKS, {}
+    )
+    assert counters.get((), 0) == 0
+
+
+def test_critical_demand_breaks_a_lease_only_as_last_resort():
+    manager = make_cpu_manager(num_blocks=8, speculative_reserve_blocks=2)
+    manager.set_lease_budget(2)
+    demand = to_keys(list(range(6)))
+    manager.complete_store(
+        manager.prepare_store(demand, _EMPTY_REQ_CTX).keys_to_store, _EMPTY_REQ_CTX
+    )
+    promoted = _promote_and_lease(manager, [9000, 9001])
+    manager.prepare_load(demand, _EMPTY_REQ_CTX)
+
+    output = manager.prepare_store(
+        to_keys([10000, 10001]),
+        _EMPTY_REQ_CTX,
+        mode=AllocationMode.DEMAND_CRITICAL,
+    )
+
+    assert output is not None
+    assert set(output.evicted_keys) == set(promoted)
     assert all(
         manager.lookup(key, _EMPTY_REQ_CTX) is LookupResult.MISS for key in promoted
-    ), "critical demand must be able to reclaim a lease"
+    )
     counters = manager.get_stats()._values
     assert (
         counters[CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_LEASE_RECLAIMED_BLOCKS][()]
         == 2
-    ), "breaking a lease is demand pressure and must be reported as such"
+    )
 
 
 def test_unleased_speculative_is_spent_before_a_leased_block():
@@ -1439,6 +1477,40 @@ def test_lease_budget_releases_the_oldest_bundle_first():
     assert list(manager._leased) == second, (
         "a newer bundle must displace the older lease, not accumulate"
     )
+
+
+def test_request_owned_bundle_cannot_be_replaced_by_a_new_owner():
+    manager = make_cpu_manager(num_blocks=8, speculative_reserve_blocks=4)
+    manager.set_lease_budget(4)
+    first_ctx = make_req_context("r0")
+    first = _promote_and_lease(manager, [9000, 9001], first_ctx, owner_id="r0")
+
+    second = manager.prepare_store(
+        to_keys([9002]),
+        make_req_context("r1"),
+        mode=AllocationMode.SPECULATIVE_ONLY,
+        owner_id="r1",
+    )
+
+    assert second is None
+    assert all(manager.lookup(key, first_ctx) is LookupResult.HIT for key in first)
+    assert manager._active_speculative_owner == "r0"
+    assert manager._lease_owner == "r0"
+
+    released = manager.release_speculative_owner("r0", demanded=True)
+    assert set(released) == set(first)
+    assert manager._active_speculative_owner is None
+    assert manager._lease_owner is None
+    assert not manager._leased
+    assert not manager._speculative
+
+    second = manager.prepare_store(
+        to_keys([9002]),
+        make_req_context("r1"),
+        mode=AllocationMode.SPECULATIVE_ONLY,
+        owner_id="r1",
+    )
+    assert second is not None
 
 
 def test_demand_releases_the_lease():

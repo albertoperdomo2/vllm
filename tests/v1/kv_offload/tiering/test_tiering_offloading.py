@@ -327,6 +327,24 @@ def test_tiering_spec_prefetch_defaults_to_shadow_mode():
     # Live submission must be an explicit opt-in until V2.0 calibration.
     assert spec.prefetch_config.shadow_mode is True
     assert spec.prefetch_config.policy == "admission"
+    assert spec.prefetch_config.jit_activation is False
+    assert spec.prefetch_config.demand_idle_only is True
+
+
+def test_tiering_spec_parses_jit_prefetch_controls():
+    spec = _make_tiering_spec(
+        {
+            "prefetch": {
+                "enabled": True,
+                "jit_activation": True,
+                "demand_idle_only": False,
+            },
+            "secondary_tiers": [{"type": "example"}],
+        }
+    )
+
+    assert spec.prefetch_config.jit_activation is True
+    assert spec.prefetch_config.demand_idle_only is False
 
 
 def test_tiering_spec_rejects_prefetch_with_v1_chunks():
@@ -375,6 +393,8 @@ def test_tiering_spec_rejects_unknown_prefetch_keys():
     [
         ({"enabled": 1}, "must be a boolean"),
         ({"shadow_mode": "yes"}, "must be a boolean"),
+        ({"jit_activation": 1}, "must be a boolean"),
+        ({"demand_idle_only": "yes"}, "must be a boolean"),
         ({"max_pending_bundles": 0}, "must be >= 1"),
         ({"max_pending_bundles": True}, "must be an integer"),
         ({"max_promotions_per_step": -1}, "must be >= 1"),
@@ -1038,6 +1058,7 @@ class TestTieringOffloadingManager:
         assert self.manager._prefetch_job_keys[job_metadata.job_id] == (
             0,
             (missing_prefetch,),
+            None,
         )
 
         self._simulate_on_schedule_end()

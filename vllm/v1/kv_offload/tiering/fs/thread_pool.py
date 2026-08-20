@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Thread pool:
-    Two queues (load, store) and two sets of threads:
-      - Load-priority threads: drain the load queue first, then the store queue.
-      - Store-priority threads: drain the store queue first, then the load queue.
-    Load jobs are enqueued to the load queue; store jobs to the store queue.
+Thread pool with demand-load, prefetch-load, and store queues.
+
+Read threads prefer demand load, then prefetch load, then store. Write threads
+prefer store, then demand load, then prefetch load. Speculative reads therefore
+use otherwise idle read capacity without sitting ahead of reactive reads.
 """
 
 import threading
@@ -49,11 +49,10 @@ class JobState:
 
 class DualQueueThreadPool:
     """
-    Thread pool with two task queues (load and store) and two thread groups.
+    Thread pool with demand-load, prefetch-load, and store queues.
 
-    Load-priority threads drain the load queue first, then fall back to the
-    store queue.  Store-priority threads do the reverse.  Both queues share
-    a single condition variable.
+    Both thread groups can drain every queue, so work can use all available
+    threads. Demand reads always precede speculative reads.
     """
 
     def __init__(
@@ -62,13 +61,15 @@ class DualQueueThreadPool:
         n_write_threads: int,
         thread_name_prefix: str = "fs_secondary_tier",
     ) -> None:
-        self._load_q: deque = deque()
+        self._demand_load_q: deque = deque()
+        self._prefetch_load_q: deque = deque()
         self._store_q: deque = deque()
         self._condition = threading.Condition(threading.Lock())
         self._stop = False
         self._threads: list[threading.Thread] = []
         self._finished_q: deque[tuple[JobId, bool]] = deque()
         self._inflight_jobs = 0  # guarded by _condition
+        self._active_demand_load_tasks = 0
 
         for i in range(n_read_threads):
             t = threading.Thread(
@@ -95,13 +96,16 @@ class DualQueueThreadPool:
         job_id: JobId,
         n_tasks: int,
         tasks: Iterable[Callable],
+        *,
+        is_prefetch: bool = False,
     ) -> None:
-        """Enqueue load tasks for a job (high-priority for load-priority threads)."""
+        """Enqueue demand or speculative load tasks for a job."""
         state = JobState(job_id, n_tasks)
         with self._condition:
             self._inflight_jobs += 1
+            queue = self._prefetch_load_q if is_prefetch else self._demand_load_q
             for fn in tasks:
-                self._load_q.append((fn, state))
+                queue.append((fn, state))
             self._condition.notify(n_tasks)
 
     def enqueue_store(
@@ -137,10 +141,16 @@ class DualQueueThreadPool:
         with self._condition:
             self._condition.wait_for(lambda: self._inflight_jobs == 0)
 
+    def has_demand_load_work(self) -> bool:
+        """Whether demand loads are queued or currently executing."""
+        with self._condition:
+            return bool(self._demand_load_q or self._active_demand_load_tasks > 0)
+
     def shutdown(self, wait: bool = True) -> None:
         with self._condition:
             self._stop = True
-            self._load_q.clear()
+            self._demand_load_q.clear()
+            self._prefetch_load_q.clear()
             self._store_q.clear()
             # Cancelled tasks will not decrement _inflight_jobs; reset it so a
             # subsequent wait_idle() returns instead of hanging.
@@ -155,13 +165,25 @@ class DualQueueThreadPool:
         while True:
             with self._condition:
                 self._condition.wait_for(
-                    lambda: self._stop or self._load_q or self._store_q
+                    lambda: (
+                        self._stop
+                        or self._demand_load_q
+                        or self._prefetch_load_q
+                        or self._store_q
+                    )
                 )
                 if self._stop:
                     return
-                primary = self._load_q if load_priority else self._store_q
-                secondary = self._store_q if load_priority else self._load_q
-                task, state = primary.popleft() if primary else secondary.popleft()
+                queues = (
+                    (self._demand_load_q, self._prefetch_load_q, self._store_q)
+                    if load_priority
+                    else (self._store_q, self._demand_load_q, self._prefetch_load_q)
+                )
+                selected = next(queue for queue in queues if queue)
+                task, state = selected.popleft()
+                is_demand_load = selected is self._demand_load_q
+                if is_demand_load:
+                    self._active_demand_load_tasks += 1
             try:
                 task()
                 job_finished, success = state.task_done(True)
@@ -173,8 +195,10 @@ class DualQueueThreadPool:
                 )
                 job_finished, success = state.task_done(False)
 
-            if job_finished:
-                with self._condition:
+            with self._condition:
+                if is_demand_load:
+                    self._active_demand_load_tasks -= 1
+                if job_finished:
                     self._finished_q.append((state.job_id, success))
                     self._inflight_jobs -= 1
-                    self._condition.notify_all()
+                self._condition.notify_all()

@@ -20,6 +20,13 @@ class PrefetchConfig:
     policy: str = "admission"
     policy_module_path: str | None = None
     shadow_mode: bool = True
+    # Defer secondary lookup and promotion until the request is close enough to
+    # demand to justify occupying the storage and CPU paths. Only one request
+    # owns speculative work at a time in this mode.
+    jit_activation: bool = False
+    # Do not activate or submit speculative work while demand lookup/load work
+    # is queued or active on the selected tier.
+    demand_idle_only: bool = True
     tier_idx: int = 0
     max_pending_bundles: int = 256
     # Global promotion I/O budget per scheduler step. Kept separate from the
@@ -62,7 +69,9 @@ class PrefetchConfig:
     transfer_base_ms: float = 0.5
     transfer_per_chunk_ms: float = 2.2
 
-    _BOOL_FIELDS = frozenset({"enabled", "shadow_mode"})
+    _BOOL_FIELDS = frozenset(
+        {"enabled", "shadow_mode", "jit_activation", "demand_idle_only"}
+    )
     _POSITIVE_INT_FIELDS = frozenset(
         {
             "max_pending_bundles",
