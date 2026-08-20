@@ -58,6 +58,14 @@ class TransferCostModel:
 
     The configured constants are seeds, used until enough samples with
     differing batch sizes exist to identify a slope.
+
+    Note on the fixed term: completions are observed by polling, at most once
+    per scheduler step, so the fitted intercept includes up to one step of
+    detection latency and is an upper bound on true I/O fixed cost rather than
+    a measurement of it. For gating that is arguably the honest number -- a
+    promotion is not usable until a step observes it -- so the gate consumes
+    the measured value as-is. Reading it as pure device latency would be wrong;
+    the first live run fitted ~470 ms this way against a ~0.93 ms/chunk slope.
     """
 
     # Enough spread in batch size to separate intercept from slope. Decayed

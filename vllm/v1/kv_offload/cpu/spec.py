@@ -34,11 +34,62 @@ class CPUOffloadingSpec(OffloadingSpec):
         definitions: dict[str, OffloadingMetricMetadata] = {
             CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC: OffloadingGaugeMetadata(
                 documentation=(
-                    "Fraction of CPU KV-cache space currently pinned by active "
-                    "transfers (0.0 = idle, 1.0 = saturated). Sustained high "
-                    "values indicate transfers (stores or promotions) may be "
-                    "dropped due to insufficient capacity."
+                    "Fraction of CPU KV-cache blocks currently PINNED by an "
+                    "in-flight transfer (ref_cnt != 0). This is not cache "
+                    "fill: a completely full but idle cache reports near "
+                    "zero, because ready evictable blocks are excluded. See "
+                    "kv_offload_cpu_cache_fill_perc for physical occupancy."
                 ),
+            ),
+            CPUOffloadingMetrics.CPU_CACHE_FILL_PERC: OffloadingGaugeMetadata(
+                documentation=(
+                    "Fraction of CPU KV-cache blocks physically allocated, "
+                    "whether or not they are evictable. 1.0 means no free "
+                    "block is available without evicting something."
+                ),
+            ),
+            CPUOffloadingMetrics.CPU_CACHE_FREE_BLOCKS: OffloadingGaugeMetadata(
+                documentation="CPU KV-cache blocks allocatable without evicting.",
+            ),
+            CPUOffloadingMetrics.CPU_CACHE_EVICTABLE_BLOCKS: OffloadingGaugeMetadata(
+                documentation=(
+                    "CPU KV-cache blocks holding ready, unpinned data that "
+                    "eviction could reclaim."
+                ),
+            ),
+            CPUOffloadingMetrics.CPU_CACHE_WRITE_PENDING_BLOCKS: (
+                OffloadingGaugeMetadata(
+                    documentation=(
+                        "CPU KV-cache blocks reserved by a store that has not "
+                        "completed."
+                    ),
+                )
+            ),
+            CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_BLOCKS: (
+                OffloadingGaugeMetadata(
+                    documentation=(
+                        "CPU KV-cache blocks owned by speculative prefetch and "
+                        "not yet demanded."
+                    ),
+                )
+            ),
+            CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_RESERVE_BLOCKS: (
+                OffloadingGaugeMetadata(
+                    documentation=(
+                        "CPU KV-cache blocks held back from demand to give "
+                        "speculative promotion bounded headroom. Best-effort, "
+                        "not guaranteed: demand borrows the unused remainder "
+                        "rather than fail a store."
+                    ),
+                )
+            ),
+            CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_RESERVE_FREE_BLOCKS: (
+                OffloadingGaugeMetadata(
+                    documentation=(
+                        "Reserved blocks speculative prefetch is not currently "
+                        "using. Zero means the reserve is the binding limit."
+                    ),
+                )
             ),
             CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC: OffloadingGaugeMetadata(
                 documentation=(

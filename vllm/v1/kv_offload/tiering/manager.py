@@ -23,7 +23,7 @@ Key Design Principles:
 import time
 from collections import OrderedDict
 from collections.abc import Collection, Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 from typing_extensions import override
@@ -45,7 +45,7 @@ from vllm.v1.kv_offload.base import (
     ScheduleEndContext,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
-from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.manager import AllocationMode, CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
@@ -252,6 +252,29 @@ class TieringOffloadingManager(OffloadingManager):
             self._promotion_timings = [
                 TransferCostModel(prefetch_config) for _ in self.secondary_tiers
             ]
+            # Applied only after every validation above, so a rejected config
+            # can never leave primary capacity sequestered. Shadow mode moves
+            # no data and must not hold blocks back from demand.
+            if not prefetch_config.shadow_mode:
+                effective_reserve = self.primary_tier.set_speculative_reserve(
+                    self._resolve_speculative_reserve(prefetch_config)
+                )
+                # The pool-fraction ceiling can cut the reserve below what
+                # config validation approved. A bundle bigger than the reserve
+                # cannot be fully resident at once -- it would recycle its own
+                # oldest blocks and evict the head of the prefix it is
+                # building -- so the ceiling has to bound the bundle too.
+                if 0 < effective_reserve < prefetch_config.max_bundle_chunks:
+                    logger.warning(
+                        "Speculative reserve resolved to %d blocks, below "
+                        "prefetch.max_bundle_chunks=%d; capping bundles to the "
+                        "reserve so a bundle cannot evict its own prefix.",
+                        effective_reserve,
+                        prefetch_config.max_bundle_chunks,
+                    )
+                    prefetch_config = replace(
+                        prefetch_config, max_bundle_chunks=effective_reserve
+                    )
             self._prefetch_policy = policy_cls(prefetch_config, self)
 
         # Proactively promoted keys awaiting a demand lookup, oldest
@@ -475,6 +498,19 @@ class TieringOffloadingManager(OffloadingManager):
         if self._prefetch_policy is not None:
             self._prefetch_policy.on_request_admitted(req_context, keys)
 
+    def _resolve_speculative_reserve(self, config: "PrefetchConfig") -> int:
+        """Blocks to hold back for speculative promotion.
+
+        Auto-derivation targets a small fraction of the pool -- enough to hold
+        several bundles in flight without materially shrinking the demand
+        cache -- with a floor of one full bundle, since a reserve too small to
+        hold one bundle can never satisfy a request.
+        """
+        if config.speculative_reserve_blocks is not None:
+            return config.speculative_reserve_blocks
+        pool = self.primary_tier._num_blocks
+        return max(config.max_bundle_chunks, pool // 64)
+
     def prefetch_tier_label(self, tier_idx: int) -> tuple[str]:
         return self._tier_label(tier_idx)
 
@@ -528,7 +564,11 @@ class TieringOffloadingManager(OffloadingManager):
                 labelvalues=label,
             )
             if self._initiate_promotion(
-                tier, key, req_context, is_prefetch=True, allow_eviction=False
+                tier,
+                key,
+                req_context,
+                is_prefetch=True,
+                mode=AllocationMode.SPECULATIVE_ONLY,
             ):
                 result.submitted.append(key)
                 self._stats.increase_counter(
@@ -538,11 +578,22 @@ class TieringOffloadingManager(OffloadingManager):
                 self._track_prefetched(key, tier_idx)
             else:
                 # Capacity refusal is normal operation for speculative work.
+                # Count the whole refused tail, not just the first key, so the
+                # V1 counters reconcile with the policy's ALLOC_REFUSED.
+                refused = keys[idx:]
+                tail = len(refused) - 1
+                if tail > 0:
+                    self._stats.increase_counter(
+                        TieringOffloadingMetrics.PREFETCH_ATTEMPTED,
+                        tail,
+                        label,
+                    )
                 self._stats.increase_counter(
                     TieringOffloadingMetrics.PREFETCH_SKIPPED,
-                    labelvalues=label,
+                    len(refused),
+                    label,
                 )
-                result.capacity_skipped.extend(keys[idx:])
+                result.capacity_skipped.extend(refused)
                 break
 
         return result
@@ -733,7 +784,7 @@ class TieringOffloadingManager(OffloadingManager):
         req_context: ReqContext,
         *,
         is_prefetch: bool = False,
-        allow_eviction: bool = True,
+        mode: AllocationMode = AllocationMode.ANY,
     ) -> bool:
         """
         Queue a block for promotion from a secondary tier to the primary tier.
@@ -757,7 +808,7 @@ class TieringOffloadingManager(OffloadingManager):
         # for this key on any subsequent lookup() call within the same step,
         # preventing duplicate promotion attempts.
         primary_write_result = self.primary_tier.prepare_write(
-            [key], req_context, allow_eviction=allow_eviction
+            [key], req_context, mode=mode
         )
 
         if primary_write_result is None:

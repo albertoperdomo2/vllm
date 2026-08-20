@@ -443,6 +443,49 @@ class TestShadowMode:
     def test_shadow_is_default(self):
         assert PrefetchConfig().shadow_mode is True
 
+    def test_shadow_drains_on_the_same_schedule_as_live(self):
+        # Shadow is the predictor for the live cell, so it has to spend the
+        # step budget the way live does. Disposing of a whole run in one step
+        # made shadow optimistic: it never re-gated the slices live would
+        # still be submitting several steps later.
+        kwargs = dict(max_promotions_per_step=2, max_bundle_chunks=8)
+        keys = to_keys(5)
+
+        live, live_host, _ = make_policy(shadow_mode=False, **kwargs)
+        resolve_all(live_host, keys, LookupResult.HIT)
+        admit(live, live_host, "r0", keys)
+
+        shadow, shadow_host, _ = make_policy(shadow_mode=True, **kwargs)
+        resolve_all(shadow_host, keys, LookupResult.HIT)
+        admit(shadow, shadow_host, "r0", keys)
+
+        # After one step both have disposed of exactly one slice.
+        live.step(empty_step())
+        shadow.step(empty_step())
+        assert counter(live, AdmissionPrefetchMetrics.SUBMITTED) == 2
+        assert counter(shadow, AdmissionPrefetchMetrics.SHADOW_SUBMIT) == 2
+        assert shadow_host.submits == []
+        assert shadow.has_pending_work()
+
+        # And both take the same number of steps to finish.
+        for _ in range(2):
+            live.step(empty_step())
+            shadow.step(empty_step())
+        assert counter(live, AdmissionPrefetchMetrics.SUBMITTED) == 5
+        assert counter(shadow, AdmissionPrefetchMetrics.SHADOW_SUBMIT) == 5
+        # Terminal bundles are reaped, and the outcome is emitted once for the
+        # whole bundle rather than once per slice.
+        assert not shadow.has_pending_work()
+        assert (
+            counter(
+                shadow,
+                AdmissionPrefetchMetrics.BUNDLE_OUTCOMES,
+                TIER_LABEL + ("shadow_submit",),
+            )
+            == 1
+        )
+        assert_partition(shadow)
+
 
 class TestCancellation:
     def test_preemption_cancels_unsubmitted_bundle(self):
@@ -549,15 +592,42 @@ class TestCapacityAndBudget:
         assert len(host.secondary_lookups) == before
         assert len(policy._active) == 1
 
-    def test_bundle_truncated_to_per_step_cap(self):
-        policy, host, _ = make_policy(max_promotions_per_step=2)
+    def test_bundle_larger_than_step_budget_submits_across_steps(self):
+        # The step budget is temporary, so a long resolved run is carried
+        # rather than discarded. Discarding it threw away 94% of the
+        # verified-resident prefix in the first benchmark.
+        policy, host, _ = make_policy(max_promotions_per_step=2, max_bundle_chunks=8)
+        keys = to_keys(5)
+        resolve_all(host, keys, LookupResult.HIT)
+        admit(policy, host, "r0", keys)
+
+        policy.step(empty_step())
+        assert host.submits == [keys[0:2]]
+        assert policy._bundles["r0"].state is BundleState.SUBMITTING
+        assert counter(policy, AdmissionPrefetchMetrics.BUNDLE_TRIM) == 0
+
+        policy.step(empty_step())
+        policy.step(empty_step())
+        assert host.submits == [keys[0:2], keys[2:4], keys[4:5]]
+        assert counter(policy, AdmissionPrefetchMetrics.SUBMITTED) == 5
+        assert_partition(policy)
+
+    def test_candidates_beyond_the_bundle_ceiling_are_counted_as_trim(self):
+        # max_bundle_chunks is the one limit no later step relaxes, and it
+        # bounds the probe as well as the bundle. The keys past it are never
+        # looked up, so they must be counted at admission or they vanish from
+        # the partition and nothing reports that the ceiling was binding.
+        policy, host, _ = make_policy(max_bundle_chunks=2)
         keys = to_keys(5)
         resolve_all(host, keys, LookupResult.HIT)
         admit(policy, host, "r0", keys)
         policy.step(empty_step())
 
         assert host.submits == [keys[:2]]
-        assert counter(policy, AdmissionPrefetchMetrics.CAPACITY_SKIP) == 3
+        assert counter(policy, AdmissionPrefetchMetrics.SUBMITTED) == 2
+        assert counter(policy, AdmissionPrefetchMetrics.BUNDLE_TRIM) == 3
+        # Every candidate is accounted for, not just the probed prefix.
+        assert counter(policy, AdmissionPrefetchMetrics.CONSIDERED) == 5
         assert_partition(policy)
 
     def test_budget_exhaustion_defers_second_bundle_to_next_step(self):
@@ -573,43 +643,19 @@ class TestCapacityAndBudget:
         # instead of losing it to whichever request resolved first.
         assert host.submits == [keys_a]
         assert policy._bundles["r1"].state is BundleState.RESIDENT
-        assert counter(policy, AdmissionPrefetchMetrics.CAPACITY_SKIP) == 0
+        assert counter(policy, AdmissionPrefetchMetrics.ALLOC_REFUSED) == 0
 
         policy.step(empty_step())
         assert host.submits == [keys_a, keys_b]
         assert_partition(policy)
 
-    def test_bundle_larger_than_whole_budget_is_capped_not_deferred(self):
-        # No later step could fit this either, so the excess is terminal.
-        policy, host, _ = make_policy(max_promotions_per_step=2)
-        keys = to_keys(5)
-        resolve_all(host, keys, LookupResult.HIT)
-        admit(policy, host, "r0", keys)
-        policy.step(empty_step())
+    def test_probe_window_bounded_by_bundle_ceiling(self):
+        # Probing keys that could never be submitted only lengthens the
+        # tier's lookup batch and pushes results past bundle deadlines.
+        policy, host, _ = make_policy(max_candidate_chunks=1024, max_bundle_chunks=16)
+        admit(policy, host, "r0", to_keys(500))
 
-        assert host.submits == [keys[:2]]
-        assert counter(policy, AdmissionPrefetchMetrics.CAPACITY_SKIP) == 3
-        assert_partition(policy)
-
-    def test_speculative_byte_budget_defers_then_submits(self):
-        policy, host, _ = make_policy(speculative_max_bytes=120, chunk_bytes=60)
-        keys_a = to_keys(1, prefix="a")
-        keys_b = to_keys(1, prefix="b")
-        keys_c = to_keys(1, prefix="c")
-        resolve_all(host, keys_a + keys_b + keys_c, LookupResult.HIT)
-        admit(policy, host, "r0", keys_a)
-        admit(policy, host, "r1", keys_b)
-        admit(policy, host, "r2", keys_c)
-        policy.step(empty_step())
-
-        # Two chunks fit the byte budget; the third waits for one to land.
-        assert host.submits == [keys_a, keys_b]
-        assert counter(policy, AdmissionPrefetchMetrics.CAPACITY_SKIP) == 0
-
-        policy.on_promotion_finished(keys_a, success=True)
-        policy.step(empty_step())
-        assert host.submits == [keys_a, keys_b, keys_c]
-        assert_partition(policy)
+        assert len(host.secondary_lookups) == 16
 
     def test_earliest_deadline_wins_the_step_budget(self):
         policy, host, _ = make_policy(
@@ -651,10 +697,10 @@ class TestCapacityAndBudget:
 
         admit(policy, host, "r1", rejected)
 
-        assert counter(policy, AdmissionPrefetchMetrics.CAPACITY_SKIP) == 3
+        assert counter(policy, AdmissionPrefetchMetrics.BUNDLE_OVERFLOW) == 3
         assert_partition(policy)
 
-    def test_submit_capacity_skip_terminalizes_bundle(self):
+    def test_submit_alloc_refusal_terminalizes_bundle(self):
         policy, host, _ = make_policy()
         keys = to_keys(2)
         resolve_all(host, keys, LookupResult.HIT)
@@ -662,7 +708,7 @@ class TestCapacityAndBudget:
         admit(policy, host, "r0", keys)
         policy.step(empty_step())
 
-        assert counter(policy, AdmissionPrefetchMetrics.CAPACITY_SKIP) == 2
+        assert counter(policy, AdmissionPrefetchMetrics.ALLOC_REFUSED) == 2
         assert not policy.has_pending_work()
         assert_partition(policy)
 

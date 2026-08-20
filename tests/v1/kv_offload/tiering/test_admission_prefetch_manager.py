@@ -24,6 +24,7 @@ from vllm.v1.kv_offload.base import (
     ScheduleEndContext,
     make_offload_key,
 )
+from vllm.v1.kv_offload.cpu.manager import AllocationMode
 from vllm.v1.kv_offload.tiering.base import (
     JobMetadata,
     JobResult,
@@ -115,10 +116,15 @@ class AsyncStubSecondaryTier(SecondaryTierManager):
 class Harness:
     """A real tiering manager plus the stub tier, driven step by step."""
 
-    def __init__(self, num_blocks=8, **prefetch_kwargs):
+    def __init__(self, num_blocks=32, **prefetch_kwargs):
         prefetch_kwargs.setdefault("enabled", True)
         prefetch_kwargs.setdefault("shadow_mode", False)
         prefetch_kwargs.setdefault("initial_admission_interval_ms", 10_000.0)
+        # Tiny pools make the 25%-of-pool reserve ceiling the binding limit,
+        # which is not what most of these tests are about. Size the policy
+        # bounds to the pool unless a test states otherwise.
+        prefetch_kwargs.setdefault("max_bundle_chunks", max(2, num_blocks // 8))
+        prefetch_kwargs.setdefault("max_promotions_per_step", max(2, num_blocks // 8))
         region = _mock_mmap_region(num_blocks)
         self.primary = CPUPrimaryTierOffloadingManager(
             num_blocks=num_blocks, mmap_region=region
@@ -265,14 +271,17 @@ class TestNonEviction:
         for key in resident:
             assert h.primary.lookup(key, ctx) is LookupResult.HIT
         assert h.counter(AdmissionPrefetchMetrics.SUBMITTED) == 0
-        assert h.counter(AdmissionPrefetchMetrics.CAPACITY_SKIP) == 2
+        assert h.counter(AdmissionPrefetchMetrics.ALLOC_REFUSED) == 2
         h.assert_partition()
 
     def test_demand_reclaims_prefetch_before_older_demand_block(self):
-        h = Harness(num_blocks=2)
+        # 25% of the pool must leave room for one reserved block.
+        h = Harness(num_blocks=4, speculative_reserve_blocks=1, max_bundle_chunks=1)
         demand_ctx = ReqContext(req_id="demand", kv_transfer_params=None)
         h.manager.on_new_request(demand_ctx)
-        old_demand = to_keys([90])
+        # Fill everything demand is allowed to use, so the next demand store
+        # has to reclaim something.
+        old_demand = to_keys([90, 92, 93])
         initial = h.manager.prepare_store(old_demand, demand_ctx)
         assert initial is not None
         h.manager.complete_store(old_demand, demand_ctx)
@@ -289,25 +298,33 @@ class TestNonEviction:
 
         assert result is not None
         assert result.evicted_keys == prefetched
-        assert h.primary.lookup(old_demand[0], demand_ctx) is LookupResult.HIT
+        for key in old_demand:
+            assert h.primary.lookup(key, demand_ctx) is LookupResult.HIT
         assert h.primary.lookup(prefetched[0], demand_ctx) is LookupResult.MISS
 
     def test_partial_capacity_submits_contiguous_prefix(self):
-        h = Harness(num_blocks=3)
-        resident = to_keys([90, 91])
-        ctx = ReqContext(req_id="demand", kv_transfer_params=None)
-        h.primary.prepare_store(resident, ctx)
-        h.primary.complete_store(resident, ctx)
+        # Demand never drops free blocks below the reserve -- it evicts its
+        # own LRU instead -- so the way the reserve runs short is a concurrent
+        # promotion already holding part of it. Park two in-flight speculative
+        # blocks (ref_cnt -1, so not reclaimable) and only one of the three
+        # reserved blocks is left for the bundle.
+        h = Harness(num_blocks=16, speculative_reserve_blocks=3, max_bundle_chunks=3)
+        parked = h.primary.prepare_store(
+            to_keys([80, 81]),
+            ReqContext(req_id="other", kv_transfer_params=None),
+            mode=AllocationMode.SPECULATIVE_ONLY,
+        )
+        assert parked is not None
 
         keys = to_keys([1, 2, 3])
         h.tier.resolve(keys)
         h.admit("r0", keys)
         h.step()
 
-        # Only one free block remains, so the contiguous prefix of length 1
-        # is submitted and the rest is capacity-skipped.
+        # The contiguous prefix that fits is submitted; the rest is refused by
+        # the allocator rather than silently dropped.
         assert h.counter(AdmissionPrefetchMetrics.SUBMITTED) == 1
-        assert h.counter(AdmissionPrefetchMetrics.CAPACITY_SKIP) == 2
+        assert h.counter(AdmissionPrefetchMetrics.ALLOC_REFUSED) == 2
         h.assert_partition()
 
 
@@ -322,7 +339,7 @@ class TestShadowMode:
         assert h.counter(AdmissionPrefetchMetrics.SHADOW_SUBMIT) == 3
         assert h.counter(AdmissionPrefetchMetrics.SUBMITTED) == 0
         # No allocation, no promotion, no V1 counter movement.
-        assert h.primary._get_num_free_blocks() == 8
+        assert h.primary._get_num_free_blocks() == h.primary._num_blocks
         assert h.manager_counter(TieringOffloadingMetrics.PREFETCH_PROMOTED) == 0
         assert not h.manager._prefetched
         assert not h.manager.has_pending_work()
@@ -523,3 +540,105 @@ class TestV1Coexistence:
         )
         assert manager._prefetch_policy is None
         assert not manager.prefetch_policy_enabled
+
+
+class TestReservedSpeculativePool:
+    def test_pool_ceiling_caps_the_bundle_it_cannot_hold(self):
+        # Config validation accepts reserve >= max_bundle_chunks, but the
+        # allocator's 25%-of-pool ceiling can cut the reserve afterwards. A
+        # bundle bigger than the surviving reserve would recycle its own
+        # oldest blocks and evict the head of the prefix it is building, so
+        # the ceiling has to bound the bundle too.
+        h = Harness(num_blocks=16, speculative_reserve_blocks=8, max_bundle_chunks=8)
+
+        assert h.primary._speculative_reserve == 4, "expected the ceiling to bind"
+        assert h.policy.config.max_bundle_chunks == 4, (
+            "bundle must be capped to the reserve that actually survived"
+        )
+
+    def test_submits_from_the_reserve_against_a_warm_cache(self):
+        """End-to-end companion to the CPU-manager regression test.
+
+        The first live benchmark submitted zero blocks because a warm cache
+        has no free blocks for a non-evicting allocation. With a reserve the
+        same situation must still produce real submissions.
+        """
+        h = Harness(num_blocks=8, speculative_reserve_blocks=2, max_bundle_chunks=2)
+        # Warm the primary tier with demand data until it is fully allocated.
+        ctx = ReqContext(req_id="demand", kv_transfer_params=None)
+        for batch in ([90, 91], [92, 93], [94, 95]):
+            output = h.primary.prepare_store(to_keys(batch), ctx)
+            assert output is not None
+            h.primary.complete_store(output.keys_to_store, ctx)
+
+        keys = to_keys([1, 2])
+        h.tier.resolve(keys)
+        h.admit("r0", keys)
+        h.step()
+
+        assert h.counter(AdmissionPrefetchMetrics.SUBMITTED) == 2
+        assert h.manager_counter(TieringOffloadingMetrics.PREFETCH_PROMOTED) == 2
+        h.assert_partition()
+
+    def test_demand_data_survives_speculative_pressure(self):
+        h = Harness(num_blocks=6, speculative_reserve_blocks=2, max_bundle_chunks=2)
+        ctx = ReqContext(req_id="demand", kv_transfer_params=None)
+        resident = to_keys([90, 91, 92, 93])
+        output = h.primary.prepare_store(resident, ctx)
+        h.primary.complete_store(output.keys_to_store, ctx)
+
+        keys = to_keys([1, 2])
+        h.tier.resolve(keys)
+        h.admit("r0", keys)
+        h.step()
+
+        for key in resident:
+            assert h.primary.lookup(key, ctx) is LookupResult.HIT
+        h.assert_partition()
+
+    def test_shadow_mode_holds_no_capacity_back(self):
+        h = Harness(num_blocks=8, shadow_mode=True, speculative_reserve_blocks=4)
+        assert h.primary._speculative_reserve == 0
+
+
+class TestIncrementalSubmission:
+    def test_long_run_submits_across_steps(self):
+        h = Harness(
+            num_blocks=64,
+            speculative_reserve_blocks=16,
+            max_bundle_chunks=8,
+            max_promotions_per_step=2,
+        )
+        keys = to_keys(range(1, 7))
+        h.tier.resolve(keys)
+        h.admit("r0", keys)
+
+        for _ in range(4):
+            h.step()
+
+        assert h.counter(AdmissionPrefetchMetrics.SUBMITTED) == 6
+        assert not h.policy.has_pending_work() or "r0" not in h.policy._bundles
+        h.assert_partition()
+
+    def test_partition_exact_when_cancelled_mid_submission(self):
+        h = Harness(
+            num_blocks=64,
+            speculative_reserve_blocks=16,
+            max_bundle_chunks=8,
+            max_promotions_per_step=2,
+        )
+        keys = to_keys(range(1, 7))
+        h.tier.resolve(keys)
+        h.tier.autocomplete = False
+        ctx = h.admit("r0", keys)
+        h.step()
+
+        # Cancel with keys still in flight: accounting must close now, the
+        # bundle-level outcome waits for the transfer.
+        h.manager.on_request_finished(ctx)
+        h.assert_partition()
+
+        h.tier.complete_pending(success=True)
+        h.step()
+        h.assert_partition()
+        assert not h.policy.has_pending_work()

@@ -22,9 +22,24 @@ class PrefetchConfig:
     shadow_mode: bool = True
     tier_idx: int = 0
     max_pending_bundles: int = 256
-    max_promotions_per_step: int = 64
+    # Global promotion I/O budget per scheduler step. Kept separate from the
+    # per-bundle limit below: conflating them capped every bundle at 64 chunks
+    # and discarded 94% of the verified-resident prefix in the first run.
+    max_promotions_per_step: int = 256
+    # Per-bundle ceiling, applied at admission: it bounds both the bundle and
+    # the residency probe, and the candidate-window tail beyond it is counted
+    # as BUNDLE_TRIM. A run that merely exceeds the remaining step budget is
+    # not trimmed -- it is carried to later steps.
+    max_bundle_chunks: int = 256
+    # Frontier-scan depth. Residency probing is bounded by max_bundle_chunks,
+    # since probing keys that could never be submitted only lengthens the
+    # tier's lookup batch and pushes results past bundle deadlines.
     max_candidate_chunks: int = 1024
-    speculative_max_bytes: int = 0
+    # CPU blocks held back from demand to give speculative promotion bounded
+    # headroom -- best-effort, since demand borrows the unused remainder
+    # rather than fail a store. One block holds one chunk. None auto-derives
+    # from the pool size; 0 disables prefetch allocation entirely.
+    speculative_reserve_blocks: int | None = None
     # Derived by TieringOffloadingSpec; not accepted from user config.
     chunk_bytes: int = 0
     # Seed for the lead-time EWMA, replaced by observation within a few
@@ -43,9 +58,14 @@ class PrefetchConfig:
 
     _BOOL_FIELDS = frozenset({"enabled", "shadow_mode"})
     _POSITIVE_INT_FIELDS = frozenset(
-        {"max_pending_bundles", "max_promotions_per_step", "max_candidate_chunks"}
+        {
+            "max_pending_bundles",
+            "max_promotions_per_step",
+            "max_bundle_chunks",
+            "max_candidate_chunks",
+        }
     )
-    _NON_NEGATIVE_INT_FIELDS = frozenset({"tier_idx", "speculative_max_bytes"})
+    _NON_NEGATIVE_INT_FIELDS = frozenset({"tier_idx"})
     _FLOAT_FIELDS = frozenset(
         {
             "initial_admission_interval_ms",
@@ -98,6 +118,12 @@ class PrefetchConfig:
             elif name == "policy":
                 if not isinstance(value, str) or not value:
                     raise ValueError("prefetch.policy must be a non-empty string")
+            elif name == "speculative_reserve_blocks":
+                if value is not None:
+                    if isinstance(value, bool) or not isinstance(value, int):
+                        raise ValueError(f"prefetch.{name} must be an integer or null")
+                    if value < 0:
+                        raise ValueError(f"prefetch.{name} must be >= 0")
             elif (
                 name == "policy_module_path"
                 and value is not None
@@ -110,4 +136,12 @@ class PrefetchConfig:
         if not 0 < alpha <= 1:
             raise ValueError("prefetch.admission_interval_ewma_alpha must be in (0, 1]")
 
-        return cls(**kwargs)
+        config = cls(**kwargs)
+        reserve = config.speculative_reserve_blocks
+        if reserve is not None and 0 < reserve < config.max_bundle_chunks:
+            raise ValueError(
+                "prefetch.speculative_reserve_blocks must be >= max_bundle_chunks "
+                f"({reserve} < {config.max_bundle_chunks}): a bundle larger than "
+                "the reserve can never be fully resident"
+            )
+        return config

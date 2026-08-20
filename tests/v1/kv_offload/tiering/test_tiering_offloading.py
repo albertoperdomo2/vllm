@@ -378,7 +378,9 @@ def test_tiering_spec_rejects_unknown_prefetch_keys():
         ({"max_pending_bundles": 0}, "must be >= 1"),
         ({"max_pending_bundles": True}, "must be an integer"),
         ({"max_promotions_per_step": -1}, "must be >= 1"),
-        ({"speculative_max_bytes": -1}, "must be >= 0"),
+        ({"speculative_reserve_blocks": -1}, "must be >= 0"),
+        ({"max_bundle_chunks": 0}, "must be >= 1"),
+        ({"speculative_max_bytes": 0}, "Unknown prefetch config keys"),
         ({"transfer_base_ms": -1.0}, "must be finite and >= 0"),
         ({"admission_interval_ewma_alpha": 0.0}, "must be in \\(0, 1\\]"),
         # Retired cost-model knobs are rejected rather than silently ignored.

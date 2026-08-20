@@ -20,7 +20,7 @@ from vllm.v1.kv_offload.cpu.common import (
     CPULoadStoreSpec,
     CPUOffloadingMetrics,
 )
-from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.manager import AllocationMode, CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 
 
@@ -41,6 +41,7 @@ def make_cpu_manager(
     enable_events: bool = False,
     store_threshold: int = 0,
     max_tracker_size: int = 64_000,
+    speculative_reserve_blocks: int = 0,
 ) -> CPUOffloadingManager:
     return CPUOffloadingManager(
         num_blocks=num_blocks,
@@ -49,6 +50,7 @@ def make_cpu_manager(
         enable_events=enable_events,
         store_threshold=store_threshold,
         max_tracker_size=max_tracker_size,
+        speculative_reserve_blocks=speculative_reserve_blocks,
     )
 
 
@@ -973,7 +975,7 @@ def test_touch_forwards_req_context_to_policy(monkeypatch):
     assert received[0][1] is ctx
 
 
-def test_prepare_store_no_evict_refuses_instead_of_evicting():
+def test_prepare_store_mode_none_refuses_instead_of_evicting():
     """Speculative allocation must never displace demand-useful blocks."""
     manager = make_cpu_manager(num_blocks=2)
     resident = to_keys([1, 2])
@@ -984,7 +986,7 @@ def test_prepare_store_no_evict_refuses_instead_of_evicting():
     # The tier is full but everything in it is evictable, so the default
     # path would succeed by evicting. The speculative path must not.
     assert (
-        manager.prepare_store(to_keys([3]), _EMPTY_REQ_CTX, allow_eviction=False)
+        manager.prepare_store(to_keys([3]), _EMPTY_REQ_CTX, mode=AllocationMode.NONE)
         is None
     )
 
@@ -992,10 +994,10 @@ def test_prepare_store_no_evict_refuses_instead_of_evicting():
         assert manager.lookup(key, _EMPTY_REQ_CTX) is LookupResult.HIT
 
 
-def test_prepare_store_no_evict_allocates_from_free_blocks():
+def test_prepare_store_mode_none_allocates_from_free_blocks():
     manager = make_cpu_manager(num_blocks=4)
     output = manager.prepare_store(
-        to_keys([1, 2]), _EMPTY_REQ_CTX, allow_eviction=False
+        to_keys([1, 2]), _EMPTY_REQ_CTX, mode=AllocationMode.NONE
     )
 
     assert output is not None
@@ -1003,28 +1005,28 @@ def test_prepare_store_no_evict_allocates_from_free_blocks():
     assert output.evicted_keys == []
 
 
-def test_prepare_store_no_evict_allocates_each_key_once():
+def test_prepare_store_mode_none_allocates_each_key_once():
     """One allocation per key: no reserve-then-consume double spend."""
     manager = make_cpu_manager(num_blocks=4)
     keys = to_keys([1, 2])
-    output = manager.prepare_store(keys, _EMPTY_REQ_CTX, allow_eviction=False)
+    output = manager.prepare_store(keys, _EMPTY_REQ_CTX, mode=AllocationMode.NONE)
     assert output is not None
     manager.complete_store(keys, _EMPTY_REQ_CTX)
 
     free_after = manager._get_num_free_blocks()
     # Re-preparing the same keys is a no-op: they are already stored.
-    repeat = manager.prepare_store(keys, _EMPTY_REQ_CTX, allow_eviction=False)
+    repeat = manager.prepare_store(keys, _EMPTY_REQ_CTX, mode=AllocationMode.NONE)
     assert repeat is not None
     assert list(repeat.keys_to_store) == []
     assert manager._get_num_free_blocks() == free_after
 
 
-def test_prepare_store_no_evict_release_frees_blocks():
+def test_prepare_store_mode_none_release_frees_blocks():
     """A cancelled speculative allocation returns its blocks to the pool."""
     manager = make_cpu_manager(num_blocks=4)
     keys = to_keys([1, 2])
     before = manager._get_num_free_blocks()
-    output = manager.prepare_store(keys, _EMPTY_REQ_CTX, allow_eviction=False)
+    output = manager.prepare_store(keys, _EMPTY_REQ_CTX, mode=AllocationMode.NONE)
     assert output is not None
     assert manager._get_num_free_blocks() < before
 
@@ -1043,7 +1045,9 @@ def test_demand_reclaims_speculative_blocks_first(eviction_policy):
     output = manager.prepare_store(demand, _EMPTY_REQ_CTX)
     assert output is not None
     manager.complete_store(demand, _EMPTY_REQ_CTX)
-    output = manager.prepare_store(speculative, _EMPTY_REQ_CTX, allow_eviction=False)
+    output = manager.prepare_store(
+        speculative, _EMPTY_REQ_CTX, mode=AllocationMode.NONE
+    )
     assert output is not None
     manager.complete_store(speculative, _EMPTY_REQ_CTX)
     manager.mark_speculative(speculative)
@@ -1055,4 +1059,173 @@ def test_demand_reclaims_speculative_blocks_first(eviction_policy):
     assert (
         sum(manager.lookup(key, _EMPTY_REQ_CTX) is LookupResult.HIT for key in demand)
         == 1
+    )
+
+
+def test_speculative_allocation_succeeds_against_a_warm_full_cache():
+    """The regression test for the zero-submission bug.
+
+    A warm cache has no *free* blocks -- everything is allocated and merely
+    evictable -- so a speculative allocation that only accepts free blocks is
+    refused forever. The reserve is what keeps headroom available.
+    """
+
+    def warm(manager):
+        """Fill the cache the way a benchmark warmup does."""
+        for batch in ([1, 2], [3, 4], [5, 6]):
+            output = manager.prepare_store(to_keys(batch), _EMPTY_REQ_CTX)
+            assert output is not None
+            manager.complete_store(output.keys_to_store, _EMPTY_REQ_CTX)
+
+    # Without a reserve the pool ends up fully allocated and merely evictable,
+    # which is exactly the state the first live benchmark ran in.
+    without = make_cpu_manager(num_blocks=4)
+    warm(without)
+    assert without._get_num_free_blocks() == 0
+    assert (
+        without.prepare_store(
+            to_keys([9]), _EMPTY_REQ_CTX, mode=AllocationMode.SPECULATIVE_ONLY
+        )
+        is None
+    ), "expected the un-reserved pool to reproduce the zero-submission refusal"
+
+    # With a reserve, demand recycles its own blocks instead of consuming the
+    # headroom, so speculative promotion still has somewhere to land.
+    with_reserve = make_cpu_manager(num_blocks=4, speculative_reserve_blocks=2)
+    warm(with_reserve)
+    output = with_reserve.prepare_store(
+        to_keys([9]), _EMPTY_REQ_CTX, mode=AllocationMode.SPECULATIVE_ONLY
+    )
+
+    assert output is not None, "speculative allocation refused on a warm cache"
+    assert list(output.keys_to_store) == to_keys([9])
+
+
+def test_speculative_never_evicts_demand_blocks():
+    """Exhausting the reserve refuses rather than touching demand data."""
+    manager = make_cpu_manager(num_blocks=4, speculative_reserve_blocks=1)
+    demand = to_keys([1, 2, 3])
+    manager.complete_store(
+        manager.prepare_store(demand, _EMPTY_REQ_CTX).keys_to_store, _EMPTY_REQ_CTX
+    )
+
+    first = manager.prepare_store(
+        to_keys([9]), _EMPTY_REQ_CTX, mode=AllocationMode.SPECULATIVE_ONLY
+    )
+    assert first is not None
+    # Reserve is now fully held by an in-flight speculative block, which
+    # cannot be recycled, so the next request must be refused.
+    assert (
+        manager.prepare_store(
+            to_keys([10]), _EMPTY_REQ_CTX, mode=AllocationMode.SPECULATIVE_ONLY
+        )
+        is None
+    )
+    for key in demand:
+        assert manager.lookup(key, _EMPTY_REQ_CTX) is LookupResult.HIT
+
+
+def test_speculative_recycles_its_own_oldest_once_the_reserve_is_full():
+    manager = make_cpu_manager(num_blocks=4, speculative_reserve_blocks=1)
+    manager.complete_store(
+        manager.prepare_store(to_keys([1, 2, 3]), _EMPTY_REQ_CTX).keys_to_store,
+        _EMPTY_REQ_CTX,
+    )
+
+    spec_a = to_keys([9])
+    manager.complete_store(
+        manager.prepare_store(
+            spec_a, _EMPTY_REQ_CTX, mode=AllocationMode.SPECULATIVE_ONLY
+        ).keys_to_store,
+        _EMPTY_REQ_CTX,
+    )
+    # Now ready and reclaimable, so a second speculative key recycles it.
+    spec_b = to_keys([10])
+    assert (
+        manager.prepare_store(
+            spec_b, _EMPTY_REQ_CTX, mode=AllocationMode.SPECULATIVE_ONLY
+        )
+        is not None
+    )
+    assert manager.lookup(spec_a[0], _EMPTY_REQ_CTX) is LookupResult.MISS
+
+
+def test_demanded_speculative_block_stops_counting_against_the_reserve():
+    manager = make_cpu_manager(num_blocks=4, speculative_reserve_blocks=1)
+    spec = to_keys([9])
+    manager.complete_store(
+        manager.prepare_store(
+            spec, _EMPTY_REQ_CTX, mode=AllocationMode.SPECULATIVE_ONLY
+        ).keys_to_store,
+        _EMPTY_REQ_CTX,
+    )
+    assert manager._reserve_unused() == 0
+
+    # Demand consumes it: it is ordinary demand data now, and the reserve
+    # is free for the next promotion.
+    manager.prepare_load(spec, _EMPTY_REQ_CTX)
+    assert manager._reserve_unused() == 1
+
+
+def test_zero_reserve_leaves_demand_arithmetic_unchanged():
+    plain = make_cpu_manager(num_blocks=4)
+    assert plain._reserve_unused() == 0
+    assert (
+        plain._num_allocatable_blocks(AllocationMode.ANY)
+        == plain._get_num_free_blocks()
+    )
+
+
+def test_demand_is_not_starved_by_the_reserve():
+    """Holding blocks back must never refuse a demand store outright."""
+    manager = make_cpu_manager(num_blocks=4, speculative_reserve_blocks=3)
+    manager.complete_store(
+        manager.prepare_store(to_keys([1, 2, 3, 4]), _EMPTY_REQ_CTX).keys_to_store,
+        _EMPTY_REQ_CTX,
+    )
+    # The reserve leaves demand only one nominally allocatable block, but a
+    # demand store larger than that must still succeed by evicting its own.
+    output = manager.prepare_store(to_keys([5, 6, 7]), _EMPTY_REQ_CTX)
+    assert output is not None
+    assert len(output.keys_to_store) == 3
+
+
+def test_capacity_gauges_distinguish_fill_from_pinned_occupancy():
+    """The gauge confusion that hid the zero-submission failure.
+
+    cpu_cache_usage_perc counts only pinned blocks, so a physically full but
+    idle cache reports near zero. The fill gauge is what actually answers
+    "is there room?".
+    """
+    manager = make_cpu_manager(num_blocks=4)
+    keys = to_keys([1, 2, 3, 4])
+    manager.complete_store(
+        manager.prepare_store(keys, _EMPTY_REQ_CTX).keys_to_store, _EMPTY_REQ_CTX
+    )
+
+    gauges = manager.get_stats()._values
+    fill = gauges[CPUOffloadingMetrics.CPU_CACHE_FILL_PERC][()]
+    pinned = gauges[CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC][()]
+
+    assert fill == 1.0, "cache is physically full"
+    assert pinned == 0.0, "nothing is pinned; this is the misleading reading"
+    assert gauges[CPUOffloadingMetrics.CPU_CACHE_FREE_BLOCKS][()] == 0
+    assert gauges[CPUOffloadingMetrics.CPU_CACHE_EVICTABLE_BLOCKS][()] == 4
+
+
+def test_speculative_reserve_gauges_track_ownership():
+    manager = make_cpu_manager(num_blocks=4, speculative_reserve_blocks=2)
+    gauges = manager.get_stats()._values
+    assert gauges[CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_RESERVE_BLOCKS][()] == 2
+    assert (
+        gauges[CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_RESERVE_FREE_BLOCKS][()] == 2
+    )
+
+    manager.prepare_store(
+        to_keys([9]), _EMPTY_REQ_CTX, mode=AllocationMode.SPECULATIVE_ONLY
+    )
+    gauges = manager.get_stats()._values
+    assert gauges[CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_BLOCKS][()] == 1
+    assert (
+        gauges[CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_RESERVE_FREE_BLOCKS][()] == 1
     )

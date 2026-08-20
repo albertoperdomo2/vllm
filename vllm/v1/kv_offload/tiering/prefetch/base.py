@@ -36,7 +36,12 @@ class AdmissionPrefetchMetrics:
     PRIMARY_REDUNDANT = "vllm:kv_offload_tiering_prefetch_admission_primary_redundant"
     SECONDARY_ABSENT = "vllm:kv_offload_tiering_prefetch_admission_secondary_absent"
     GATE_REJECT = "vllm:kv_offload_tiering_prefetch_admission_gate_reject"
-    CAPACITY_SKIP = "vllm:kv_offload_tiering_prefetch_admission_capacity_skip"
+    # Capacity refusals, split by cause. A single capacity_skip counter made
+    # the first benchmark unattributable: hard-cap trimming and allocator
+    # refusal are entirely different failures with entirely different fixes.
+    BUNDLE_OVERFLOW = "vllm:kv_offload_tiering_prefetch_admission_bundle_overflow"
+    BUNDLE_TRIM = "vllm:kv_offload_tiering_prefetch_admission_bundle_trim"
+    ALLOC_REFUSED = "vllm:kv_offload_tiering_prefetch_admission_alloc_refused"
     SUBMITTED = "vllm:kv_offload_tiering_prefetch_admission_submitted"
     SHADOW_SUBMIT = "vllm:kv_offload_tiering_prefetch_admission_shadow_submit"
     LOOKUP_UNRESOLVED = "vllm:kv_offload_tiering_prefetch_admission_lookup_unresolved"
@@ -60,7 +65,9 @@ class AdmissionPrefetchMetrics:
         PRIMARY_REDUNDANT,
         SECONDARY_ABSENT,
         GATE_REJECT,
-        CAPACITY_SKIP,
+        BUNDLE_OVERFLOW,
+        BUNDLE_TRIM,
+        ALLOC_REFUSED,
         SUBMITTED,
         SHADOW_SUBMIT,
         LOOKUP_UNRESOLVED,
@@ -104,8 +111,16 @@ def build_admission_prefetch_metric_definitions(
             "keys resolved absent from the secondary tier"
         ),
         AdmissionPrefetchMetrics.GATE_REJECT: ("keys rejected by the deadline gate"),
-        AdmissionPrefetchMetrics.CAPACITY_SKIP: (
-            "keys skipped for capacity or budget reasons"
+        AdmissionPrefetchMetrics.BUNDLE_OVERFLOW: (
+            "keys dropped because too many bundles were already live"
+        ),
+        AdmissionPrefetchMetrics.BUNDLE_TRIM: (
+            "candidate keys past the per-bundle ceiling, declined at admission "
+            "and never probed; a high share means max_bundle_chunks is the "
+            "binding constraint"
+        ),
+        AdmissionPrefetchMetrics.ALLOC_REFUSED: (
+            "keys the primary tier refused to allocate a speculative block for"
         ),
         AdmissionPrefetchMetrics.SUBMITTED: ("keys submitted for proactive promotion"),
         AdmissionPrefetchMetrics.SHADOW_SUBMIT: (
@@ -175,8 +190,11 @@ def build_admission_prefetch_metric_definitions(
     )
     definitions[AdmissionPrefetchMetrics.TRANSFER_COST_BASE] = OffloadingGaugeMetadata(
         documentation=(
-            "Admission prefetch: measured fixed cost per promotion job. Reported "
-            "only once enough real transfers have been observed to fit it."
+            "Admission prefetch: measured fixed cost per promotion job. "
+            "Includes completion-detection latency of up to one scheduler "
+            "step, so it is an upper bound on device fixed cost, not a "
+            "measurement of it. Reported only once enough real transfers "
+            "have been observed to fit it."
         ),
         labelnames=("tier",),
     )

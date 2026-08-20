@@ -35,8 +35,22 @@ Configuration via kv_connector_extra_config:
       - shadow_mode: (default TRUE) evaluate and log gate decisions without
         moving any data. Keep enabled until the transfer/lead-time constants
         below are calibrated for the deployment
-      - tier_idx, max_pending_bundles, max_promotions_per_step,
-        max_candidate_chunks, speculative_max_bytes: bounds on policy work
+      - speculative_reserve_blocks: CPU blocks held back from demand to give
+        speculative promotion bounded headroom. One block holds one chunk.
+        Best-effort, not guaranteed: demand borrows the unused remainder
+        rather than fail a store, since a missed prefetch is far cheaper than
+        a refused demand store. A warm cache has no free blocks -- everything
+        is allocated
+        and merely evictable -- so without a reserve every non-evicting
+        speculative allocation is refused. null auto-derives from the other
+        bounds; 0 disables promotion. Clamped to 25% of the pool.
+      - max_bundle_chunks: per-bundle ceiling, and the depth of the residency
+        probe. A run longer than this is trimmed
+      - max_promotions_per_step: global promotion I/O budget per scheduler
+        step. A bundle exceeding it submits across successive steps rather
+        than losing the remainder
+      - tier_idx, max_pending_bundles, max_candidate_chunks: further bounds
+        on policy work
       - initial_admission_interval_ms, admission_interval_ewma_alpha,
         transfer_base_ms, transfer_per_chunk_ms, p_use,
         demand_load_per_chunk_ms, delta_q_active_ms, c_failure_ms:
