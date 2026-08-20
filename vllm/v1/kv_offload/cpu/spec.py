@@ -91,6 +91,20 @@ class CPUOffloadingSpec(OffloadingSpec):
                     ),
                 )
             ),
+            CPUOffloadingMetrics.CPU_CACHE_RESERVE_BORROWED_BLOCKS: (
+                OffloadingCounterMetadata(
+                    documentation=(
+                        "Reserved CPU KV-cache blocks consumed by critical "
+                        "demand because eviction could not satisfy it. "
+                        "Measured in blocks, so the rate says how much of the "
+                        "prefetch budget demand pressure is eroding, not just "
+                        "that it happened. A rising rate alongside "
+                        "free_blocks below speculative_reserve_blocks means "
+                        "demand pressure, not a prefetch bug, is consuming "
+                        "the headroom."
+                    ),
+                )
+            ),
             CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC: OffloadingGaugeMetadata(
                 documentation=(
                     "Fraction of CPU KV-cache space currently pinned by "

@@ -784,7 +784,7 @@ class TieringOffloadingManager(OffloadingManager):
         req_context: ReqContext,
         *,
         is_prefetch: bool = False,
-        mode: AllocationMode = AllocationMode.ANY,
+        mode: AllocationMode = AllocationMode.DEMAND_CRITICAL,
     ) -> bool:
         """
         Queue a block for promotion from a secondary tier to the primary tier.
@@ -799,6 +799,9 @@ class TieringOffloadingManager(OffloadingManager):
             tier: The secondary tier to promote from
             key: Block to promote
             req_context: Per-request context forwarded to primary.prepare_write().
+            mode: defaults to DEMAND_CRITICAL because the reactive path serves
+                a request that is running now, so it may borrow the reserve
+                rather than fail. The speculative caller overrides this.
 
         Returns:
             True if promotion was initiated, False if primary tier is full.
@@ -967,7 +970,14 @@ class TieringOffloadingManager(OffloadingManager):
         # Cascading of these newly-stored blocks to ALL secondary tiers
         # happens later in complete_store(), after the GPU→Primary transfer
         # completes.
-        primary_result = self.primary_tier.prepare_store(keys, req_context)
+        # This method is only ever the GPU->CPU persistence path: no request
+        # currently running is blocked on it, so it may decline rather than
+        # spend reserved blocks. Stated explicitly because it is load-bearing
+        # -- letting this caller borrow is what left the reserve empty and
+        # every speculative allocation refused.
+        primary_result = self.primary_tier.prepare_store(
+            keys, req_context, mode=AllocationMode.DEMAND_CACHE
+        )
 
         if primary_result is None:
             return None

@@ -34,13 +34,30 @@ logger = init_logger(__name__)
 class AllocationMode(enum.Enum):
     """How far a caller may go to make room for its blocks.
 
-    ANY is the demand path: reclaim speculative blocks first, then evict
-    demand data through the cache policy. SPECULATIVE_ONLY may reclaim only
-    blocks speculative work itself populated, so prefetch can never displace
-    data the running workload owns. NONE takes free blocks or nothing.
+    The two demand modes differ only in what they do when eviction cannot
+    satisfy them, and that difference is what keeps the speculative reserve
+    physically real:
+
+    DEMAND_CACHE is GPU->CPU cache persistence. Refusing it is not free -- it
+    sacrifices future reuse of that prefix -- but nothing currently running is
+    waiting on it, so it declines rather than consume reserved blocks. This is
+    the highest-volume caller; letting it borrow is how the reserve became an
+    accounting fiction.
+
+    DEMAND_CRITICAL is a reactive promotion serving a request that is running
+    now. It may borrow the reserve as a last resort, because a missed prefetch
+    is a far cheaper failure than a stalled request.
+
+    The distinction is therefore urgency, not the value of the data.
+
+    Both reclaim speculative blocks before evicting demand data through the
+    cache policy. SPECULATIVE_ONLY may reclaim only blocks speculative work
+    itself populated, so prefetch can never displace data the running workload
+    owns. NONE takes free blocks or nothing.
     """
 
-    ANY = enum.auto()
+    DEMAND_CACHE = enum.auto()
+    DEMAND_CRITICAL = enum.auto()
     SPECULATIVE_ONLY = enum.auto()
     NONE = enum.auto()
 
@@ -96,6 +113,11 @@ class CPUOffloadingManager(OffloadingManager):
         self.max_tracker_size: int = max_tracker_size
         self.stores_skipped_in_current_batch: int = 0
         self.allocation_sizes_in_current_batch: list[int] = []
+        # Reserved blocks consumed by critical demand. Counted in blocks so
+        # the rate distinguishes a harmless one-block dip from an erosion of
+        # the whole prefetch budget; the free/reserve-free gauges show the
+        # resulting shortfall but not who caused it.
+        self.reserve_blocks_borrowed_in_current_batch: int = 0
 
         # Number of block references. It is ordered so can evict the LRU entry in O(1).
         self.counts: OrderedDict[OffloadKey, int] | None = (
@@ -149,11 +171,24 @@ class CPUOffloadingManager(OffloadingManager):
         LRU instead of consuming the headroom speculative work depends on.
         With a zero reserve both branches reduce to the raw free count, so the
         demand path is arithmetically unchanged when prefetch is off.
+
+        For demand the result is deliberately allowed to go NEGATIVE when free
+        blocks have fallen below the reserve. That negative value is what
+        carries the shortfall into the caller's eviction target, making every
+        demand allocation restore the watermark:
+
+            evict(n - (free - reserve_unused)) then allocate(n)
+                -> free == reserve_unused
+
+        Clamping this at zero caps the target at exactly what demand needs, so
+        eviction frees n blocks and the allocation immediately consumes all n.
+        Free then stays pinned wherever it fell, permanently -- which is how a
+        reserve of 64 came to report 64 unused blocks while zero were free.
         """
         raw = self._get_num_free_blocks()
         if mode is AllocationMode.SPECULATIVE_ONLY:
             return min(raw, self._reserve_unused())
-        return max(0, raw - self._reserve_unused())
+        return raw - self._reserve_unused()
 
     def _allocate_blocks(self, keys: list[OffloadKey]) -> list[BlockStatus]:
         num_fresh = min(len(keys), self._num_blocks - self._num_allocated_blocks)
@@ -306,14 +341,17 @@ class CPUOffloadingManager(OffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
         *,
-        mode: AllocationMode = AllocationMode.ANY,
+        mode: AllocationMode = AllocationMode.DEMAND_CACHE,
     ) -> PrepareStoreOutput | None:
         """Allocate primary blocks for the given keys.
 
         Args:
             mode: how far this caller may go to make room. See AllocationMode.
-                Speculative callers are bounded by the reserve and may reclaim
-                only their own blocks, so prefetch cannot displace demand data.
+                Defaults to DEMAND_CACHE, the strict contract: an unqualified
+                store is cache persistence, which declines rather than spend
+                the speculative reserve. Speculative callers are bounded by
+                the reserve and may reclaim only their own blocks, so prefetch
+                cannot displace demand data.
         """
         speculative = mode is AllocationMode.SPECULATIVE_ONLY
         if not speculative:
@@ -366,10 +404,21 @@ class CPUOffloadingManager(OffloadingManager):
                     num_blocks_to_evict, protected
                 )
                 if normal_evicted is None:
-                    # Holding the reserve back must never starve demand: retry
-                    # against raw free before refusing. A missed prefetch is a
-                    # far cheaper failure than a refused demand store.
-                    shortfall = len(keys_to_store) - self._get_num_free_blocks()
+                    if mode is AllocationMode.DEMAND_CACHE:
+                        # Nothing running is waiting on this store -- it buys
+                        # future reuse, not progress on the current request --
+                        # so it declines rather than spend reserved blocks.
+                        # (Declining is not free: it sacrifices that reuse.
+                        # It is simply cheaper than starving prefetch, which
+                        # is what emptied the reserve during warmup.)
+                        return None
+                    # A request is waiting on this one, so holding the reserve
+                    # back must never starve it: retry against raw free before
+                    # refusing, borrowing reserved blocks if that is the only
+                    # way. The watermark restores on later demand allocations.
+                    free_before = self._get_num_free_blocks()
+                    reserve_unused = self._reserve_unused()
+                    shortfall = len(keys_to_store) - free_before
                     reclaimed, normal_evicted = (
                         self._evict_for_demand(shortfall, protected)
                         if shortfall > 0
@@ -377,6 +426,19 @@ class CPUOffloadingManager(OffloadingManager):
                     )
                     if normal_evicted is None:
                         return None
+                    # Reserve actually consumed is the loss of *backed*
+                    # headroom, min(free, reserve_unused), across this
+                    # allocation -- not the whole reserve. A shortfall of zero
+                    # or less evicts nothing and still spends free blocks.
+                    free_after = (
+                        free_before
+                        + len(reclaimed)
+                        + len(normal_evicted)
+                        - len(keys_to_store)
+                    )
+                    self.reserve_blocks_borrowed_in_current_batch += min(
+                        free_before, reserve_unused
+                    ) - min(free_after, reserve_unused)
                 evicted = reclaimed + normal_evicted
 
         to_evict: list[OffloadKey] = []
@@ -540,6 +602,12 @@ class CPUOffloadingManager(OffloadingManager):
             CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_RESERVE_FREE_BLOCKS,
             self._reserve_unused(),
         )
+        if self.reserve_blocks_borrowed_in_current_batch:
+            stats.increase_counter(
+                CPUOffloadingMetrics.CPU_CACHE_RESERVE_BORROWED_BLOCKS,
+                counter_increase_value=self.reserve_blocks_borrowed_in_current_batch,
+            )
+            self.reserve_blocks_borrowed_in_current_batch = 0
 
         if self.store_threshold >= 2:
             stats.increase_counter(

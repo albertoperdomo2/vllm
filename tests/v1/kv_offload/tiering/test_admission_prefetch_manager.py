@@ -543,6 +543,59 @@ class TestV1Coexistence:
 
 
 class TestReservedSpeculativePool:
+    def test_reserve_survives_warmup_through_the_real_persistence_path(self):
+        """The end-to-end regression for the bounded-reserve failure.
+
+        The unit tests cover the allocator directly; this drives the actual
+        GPU->CPU persistence path (TieringOffloadingManager.prepare_store)
+        until the cache is full, because that is the caller whose fallback
+        drained the reserve in production. The live run reported reserve=64
+        and reserve_free=64 while zero blocks were free and every speculative
+        allocation was refused, so both halves are asserted: the reserve is
+        still physically backed, AND a bundle actually submits.
+        """
+        h = Harness(num_blocks=64, speculative_reserve_blocks=8, max_bundle_chunks=8)
+        demand_ctx = ReqContext(req_id="demand", kv_transfer_params=None)
+        h.manager.on_new_request(demand_ctx)
+
+        # Warm the cache to capacity through the persistence path.
+        key_id = 100
+        for _ in range(20):
+            batch = to_keys(list(range(key_id, key_id + 8)))
+            key_id += 8
+            output = h.manager.prepare_store(batch, demand_ctx)
+            if output is not None:
+                h.manager.complete_store(batch, demand_ctx)
+            h.step()
+
+        # Then pile on stores that never complete. Write-pending blocks are
+        # unevictable, so eviction starts failing and the allocator reaches
+        # its fallback -- the condition that drained the reserve at
+        # concurrency 64. Without this pressure the bug is invisible: eviction
+        # always succeeds and the fallback never runs.
+        for _ in range(10):
+            batch = to_keys(list(range(key_id, key_id + 8)))
+            key_id += 8
+            h.manager.prepare_store(batch, demand_ctx)
+            h.step()
+
+        free = h.primary._get_num_free_blocks()
+        assert free >= 8, (
+            f"cache persistence drained the reserve: {free} free blocks remain "
+            "of 8 reserved -- this is the production failure"
+        )
+
+        # And the reserve must be usable, not merely present.
+        keys = to_keys([1, 2, 3, 4])
+        h.tier.resolve(keys)
+        h.admit("r0", keys)
+        h.step()
+
+        assert h.counter(AdmissionPrefetchMetrics.SUBMITTED) == 4
+        assert h.counter(AdmissionPrefetchMetrics.ALLOC_REFUSED) == 0
+        assert len(h.primary._speculative) > 0, "no destination block was claimed"
+        h.assert_partition()
+
     def test_pool_ceiling_caps_the_bundle_it_cannot_hold(self):
         # Config validation accepts reserve >= max_bundle_chunks, but the
         # allocator's 25%-of-pool ceiling can cut the reserve afterwards. A

@@ -24,6 +24,14 @@ class CPUOffloadingMetrics:
     CPU_CACHE_SPECULATIVE_RESERVE_FREE_BLOCKS = (
         "vllm:kv_offload_cpu_cache_speculative_reserve_free_blocks"
     )
+    # Reserved blocks consumed by critical demand. Counted in BLOCKS, not
+    # events: an event count says a borrow happened, blocks say whether it was
+    # harmless (one block) or ate the whole prefetch budget. The gauges above
+    # show a shortfall but not its cause; the first bounded-reserve run had to
+    # infer the borrow from free=0 while reserve_free=64.
+    CPU_CACHE_RESERVE_BORROWED_BLOCKS = (
+        "vllm:kv_offload_cpu_cache_reserve_borrowed_blocks"
+    )
 
 
 class CPULoadStoreSpec(BlockIDsLoadStoreSpec):

@@ -1167,27 +1167,165 @@ def test_demanded_speculative_block_stops_counting_against_the_reserve():
     assert manager._reserve_unused() == 1
 
 
-def test_zero_reserve_leaves_demand_arithmetic_unchanged():
+@pytest.mark.parametrize(
+    "mode", [AllocationMode.DEMAND_CACHE, AllocationMode.DEMAND_CRITICAL]
+)
+def test_zero_reserve_leaves_demand_arithmetic_unchanged(mode):
+    # Guards the reactive cells: with prefetch off, neither demand contract
+    # may differ from the raw free count.
     plain = make_cpu_manager(num_blocks=4)
     assert plain._reserve_unused() == 0
-    assert (
-        plain._num_allocatable_blocks(AllocationMode.ANY)
-        == plain._get_num_free_blocks()
-    )
+    assert plain._num_allocatable_blocks(mode) == plain._get_num_free_blocks()
 
 
-def test_demand_is_not_starved_by_the_reserve():
-    """Holding blocks back must never refuse a demand store outright."""
+def test_critical_demand_is_not_starved_by_the_reserve():
+    """A request waiting on this store outranks speculative headroom."""
     manager = make_cpu_manager(num_blocks=4, speculative_reserve_blocks=3)
+    # Warm through the critical path: on a 4-block pool with 3 reserved, the
+    # strict cache-store contract would (correctly) decline this.
     manager.complete_store(
-        manager.prepare_store(to_keys([1, 2, 3, 4]), _EMPTY_REQ_CTX).keys_to_store,
+        manager.prepare_store(
+            to_keys([1, 2, 3, 4]),
+            _EMPTY_REQ_CTX,
+            mode=AllocationMode.DEMAND_CRITICAL,
+        ).keys_to_store,
         _EMPTY_REQ_CTX,
     )
     # The reserve leaves demand only one nominally allocatable block, but a
-    # demand store larger than that must still succeed by evicting its own.
-    output = manager.prepare_store(to_keys([5, 6, 7]), _EMPTY_REQ_CTX)
+    # critical store larger than that must still succeed by evicting its own.
+    output = manager.prepare_store(
+        to_keys([5, 6, 7]), _EMPTY_REQ_CTX, mode=AllocationMode.DEMAND_CRITICAL
+    )
     assert output is not None
     assert len(output.keys_to_store) == 3
+
+
+def _fill_with_demand(manager, start, batches, mode=None, complete=True, batch_size=10):
+    """Drive demand stores.
+
+    With complete=False the stores are left in flight (ref_cnt -1), which is
+    what makes blocks unevictable and forces the allocator into its fallback --
+    the warmup condition at high concurrency.
+    """
+    ctx = _EMPTY_REQ_CTX
+    in_flight = []
+    key_id = start
+    kwargs = {"mode": mode} if mode is not None else {}
+    for _ in range(batches):
+        batch = to_keys(list(range(key_id, key_id + batch_size)))
+        key_id += batch_size
+        output = manager.prepare_store(batch, ctx, **kwargs)
+        if output is None:
+            break
+        if complete:
+            manager.complete_store(output.keys_to_store, ctx)
+        else:
+            in_flight.append(output.keys_to_store)
+    return key_id, in_flight
+
+
+def test_borrowed_reserve_is_restored_by_later_demand():
+    """The regression test for the second zero-submission failure.
+
+    A transient borrow used to be permanent: the eviction target was clamped
+    to exactly what demand needed, so eviction freed N blocks and the
+    allocation consumed all N. Free stayed pinned wherever it fell, and the
+    live run reported reserve=64/reserve_free=64 while zero blocks were free
+    and every speculative allocation was refused.
+    """
+    manager = make_cpu_manager(num_blocks=100, speculative_reserve_blocks=16)
+    key_id, _ = _fill_with_demand(manager, 0, batches=30)
+    assert manager._get_num_free_blocks() == 16, (
+        "reserve should be held at steady state"
+    )
+
+    # Pin the cache with in-flight stores so eviction cannot find candidates,
+    # forcing a critical allocation to borrow. This is warmup at concurrency 64.
+    key_id, in_flight = _fill_with_demand(
+        manager, key_id, batches=9, mode=AllocationMode.DEMAND_CRITICAL, complete=False
+    )
+    borrowed = manager._get_num_free_blocks()
+    assert borrowed < 16, "expected the critical path to dip into the reserve"
+    assert manager.reserve_blocks_borrowed_in_current_batch > 0
+
+    # Release the pressure and run ordinary traffic: the watermark must return.
+    for keys in in_flight:
+        manager.complete_store(keys, _EMPTY_REQ_CTX)
+    _fill_with_demand(manager, key_id, batches=40)
+
+    assert manager._get_num_free_blocks() == 16, (
+        "reserve must be restored by demand eviction, not stay borrowed forever"
+    )
+    assert (
+        manager.prepare_store(
+            to_keys([9001, 9002]),
+            _EMPTY_REQ_CTX,
+            mode=AllocationMode.SPECULATIVE_ONLY,
+        )
+        is not None
+    ), "speculative allocation must succeed once the reserve is backed again"
+
+
+def test_cache_store_declines_rather_than_spend_the_reserve():
+    """GPU->CPU persistence is optional; a running request's load is not.
+
+    The connector counts an allocation failure and continues, so a cache
+    store must never consume speculative headroom. Letting it is what emptied
+    the reserve during warmup.
+    """
+    strict = make_cpu_manager(num_blocks=100, speculative_reserve_blocks=16)
+    key_id, _ = _fill_with_demand(strict, 0, batches=30)
+    _fill_with_demand(
+        strict,
+        key_id,
+        batches=9,
+        mode=AllocationMode.DEMAND_CACHE,
+        complete=False,
+    )
+    assert strict._get_num_free_blocks() == 16, (
+        "cache stores must not touch the reserve"
+    )
+    assert strict.reserve_blocks_borrowed_in_current_batch == 0
+
+    critical = make_cpu_manager(num_blocks=100, speculative_reserve_blocks=16)
+    key_id, _ = _fill_with_demand(critical, 0, batches=30)
+    _fill_with_demand(
+        critical,
+        key_id,
+        batches=9,
+        mode=AllocationMode.DEMAND_CRITICAL,
+        complete=False,
+    )
+    assert critical._get_num_free_blocks() < 16, "critical demand may borrow"
+    assert critical.reserve_blocks_borrowed_in_current_batch > 0
+
+
+def test_reserve_borrow_counter_measures_blocks_not_events():
+    """Blocks, not events: the magnitude is the actionable part.
+
+    An event count says a borrow happened; blocks say whether it was a
+    one-block dip or ate the whole prefetch budget.
+    """
+    manager = make_cpu_manager(num_blocks=100, speculative_reserve_blocks=16)
+    key_id, _ = _fill_with_demand(manager, 0, batches=30)
+    free_before = manager._get_num_free_blocks()
+    _fill_with_demand(
+        manager,
+        key_id,
+        batches=9,
+        mode=AllocationMode.DEMAND_CRITICAL,
+        complete=False,
+    )
+    consumed = free_before - manager._get_num_free_blocks()
+
+    counters = manager.get_stats()._values
+    borrowed = counters[CPUOffloadingMetrics.CPU_CACHE_RESERVE_BORROWED_BLOCKS][()]
+    assert borrowed == consumed, (
+        "counter must equal the reserved blocks actually consumed, "
+        f"not an event count ({borrowed} vs {consumed} blocks)"
+    )
+    assert borrowed > 1, "a single event here consumed multiple blocks"
+    assert manager.reserve_blocks_borrowed_in_current_batch == 0
 
 
 def test_capacity_gauges_distinguish_fill_from_pinned_occupancy():
