@@ -861,6 +861,85 @@ class TestTieringOffloadingManager:
         assert block not in self.manager._prefetched
         assert_prefetch_accounting(stats, self.manager)
 
+    def test_retention_lease_is_wired_into_real_promotion_completion(
+        self, manager_setup
+    ):
+        """End-to-end retention through the production promotion path.
+
+        The CPU-manager tests call lease_speculative() directly, so they prove
+        the mechanism but not the wiring. This drives a real proactive
+        promotion to completion and never touches the lease itself: if
+        _flush_pending_promotions stops leasing, the block is evicted here
+        exactly as it was in the live run that wasted 96.5% of promotions.
+
+        The V1 assume-resident path is used deliberately -- it reaches the
+        same completion hook as the V2 admission policy, so both entry points
+        are covered.
+        """
+        self.primary_tier.set_speculative_reserve(1)
+        assert self.primary_tier.set_lease_budget(1) == 1
+        self._start_request()
+        # Ordinary demand data, so persistence has a victim of its own later.
+        resident = to_keys([10, 11])
+        assert self.manager.prepare_store(resident, _CTX) is not None
+        self.manager.complete_store(resident, _CTX)
+
+        block = to_keys([1])[0]
+        self._complete_tracked_promotion(block)
+
+        # Leased by production code alone.
+        assert block in self.primary_tier._leased
+
+        # Ordinary GPU->CPU persistence under pressure evicts its own LRU
+        # rather than the promotion. Two demand blocks are already resident,
+        # so a victim exists that is not the leased one.
+        result = self.manager.prepare_store(to_keys([20, 21]), _CTX)
+        assert result is not None, "persistence should evict demand, not decline"
+        assert block not in result.evicted_keys, (
+            "cache persistence reclaimed the promoted block despite its lease"
+        )
+
+        # It survives to demand, and demand resolves it as useful.
+        assert self.manager.lookup(block, _CTX) is LookupResult.HIT
+        assert block not in self.primary_tier._leased, (
+            "the lease must be released once demand has consumed the block"
+        )
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_USEFUL) == 1
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_WASTED) == 0
+        assert (
+            counter_total(
+                stats, TieringOffloadingMetrics.PREFETCH_EVICTED_BEFORE_DEMAND
+            )
+            == 0
+        )
+        assert_prefetch_accounting(stats, self.manager)
+
+    def test_persistence_declines_rather_than_consume_a_lease(self, manager_setup):
+        """When only a leased block would satisfy it, persistence backs off.
+
+        Nothing running is waiting on a cache store, so losing it costs future
+        reuse; breaking the lease costs the promotion the queued request is
+        about to need. The store declines and the promotion survives.
+        """
+        self.primary_tier.set_speculative_reserve(1)
+        self.primary_tier.set_lease_budget(1)
+        self._start_request()
+        block = to_keys([1])[0]
+        self._complete_tracked_promotion(block)
+        assert block in self.primary_tier._leased
+
+        # The promoted block is the only eviction candidate on this 5-block
+        # tier, so satisfying this store would mean consuming the lease.
+        assert self.manager.prepare_store(to_keys(range(10, 15)), _CTX) is None
+
+        assert self.manager.lookup(block, _CTX) is LookupResult.HIT
+        stats = self.manager.get_stats()
+        assert stats is not None
+        assert counter_total(stats, TieringOffloadingMetrics.PREFETCH_USEFUL) == 1
+
     def test_prefetch_in_flight_promotion_stays_tracked(self, manager_setup):
         """The first HIT_PENDING is late once and can still become useful."""
         self._start_request()

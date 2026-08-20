@@ -223,6 +223,26 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             ),
             labelnames=("tier",),
         )
+        metrics[TieringOffloadingMetrics.PREFETCH_EVICTED_BEFORE_DEMAND] = (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of prefetch-promoted chunks that ordinary cache "
+                    "persistence reclaimed before any demand lookup reached "
+                    "them, labeled by tier. A strict SUBSET of "
+                    "PREFETCH_WASTED, which still counts these -- this only "
+                    "attributes one cause. It is NOT every pre-demand "
+                    "eviction: a promotion displaced by a later speculative "
+                    "promotion is counted as wasted but not here. Read it "
+                    "against the other two causes -- speculative "
+                    "displacement, visible as "
+                    "cpu_cache_speculative_reserve_free_blocks reaching zero, "
+                    "and a lead time too short for demand to arrive at all. "
+                    "The three have different fixes: retention, a larger "
+                    "reserve, and the admission horizon respectively."
+                ),
+                labelnames=("tier",),
+            )
+        )
         metrics[TieringOffloadingMetrics.PREFETCH_UNTRACKED] = (
             OffloadingCounterMetadata(
                 documentation=(

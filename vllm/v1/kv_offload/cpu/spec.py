@@ -91,6 +91,26 @@ class CPUOffloadingSpec(OffloadingSpec):
                     ),
                 )
             ),
+            CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_LEASED_BLOCKS: (
+                OffloadingGaugeMetadata(
+                    documentation=(
+                        "Ready speculative blocks currently retained against "
+                        "ordinary cache persistence, so demand has a chance "
+                        "to consume them. Zero while retention is disabled."
+                    ),
+                )
+            ),
+            CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_LEASE_RECLAIMED_BLOCKS: (
+                OffloadingCounterMetadata(
+                    documentation=(
+                        "Retained speculative blocks reclaimed by demand-"
+                        "critical pressure. This is retention being "
+                        "overridden to keep a running request moving, not a "
+                        "prefetch misprediction -- read it separately from "
+                        "the wasted/late outcome counters."
+                    ),
+                )
+            ),
             CPUOffloadingMetrics.CPU_CACHE_RESERVE_BORROWED_BLOCKS: (
                 OffloadingCounterMetadata(
                     documentation=(

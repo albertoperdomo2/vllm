@@ -276,7 +276,16 @@ class TestNonEviction:
 
     def test_demand_reclaims_prefetch_before_older_demand_block(self):
         # 25% of the pool must leave room for one reserved block.
-        h = Harness(num_blocks=4, speculative_reserve_blocks=1, max_bundle_chunks=1)
+        # retention_lease_bundles=0 keeps the pre-lease victim order, where a
+        # promoted block is the preferred victim. With retention on, that is
+        # exactly the behaviour the lease inverts -- see
+        # test_lease_makes_persistence_evict_demand_before_a_promoted_block.
+        h = Harness(
+            num_blocks=4,
+            speculative_reserve_blocks=1,
+            max_bundle_chunks=1,
+            retention_lease_bundles=0,
+        )
         demand_ctx = ReqContext(req_id="demand", kv_transfer_params=None)
         h.manager.on_new_request(demand_ctx)
         # Fill everything demand is allowed to use, so the next demand store
@@ -326,6 +335,118 @@ class TestNonEviction:
         assert h.counter(AdmissionPrefetchMetrics.SUBMITTED) == 1
         assert h.counter(AdmissionPrefetchMetrics.ALLOC_REFUSED) == 2
         h.assert_partition()
+
+
+class TestRetentionLease:
+    """A promoted copy must survive ordinary persistence long enough to be used.
+
+    Without retention, speculative blocks are the *preferred* eviction victim,
+    so a promotion is reclaimed before the queued request it was fetched for
+    ever arrives. That is the mechanism behind 96.5% wasted promotions in the
+    first live run with a working data plane.
+    """
+
+    def _promote(self, h, key_id, demand_ctx):
+        keys = to_keys([key_id])
+        h.tier.resolve(keys)
+        h.admit(f"r{key_id}", keys)
+        h.step()
+        h.step()
+        return keys
+
+    def test_promoted_block_survives_ordinary_persistence(self):
+        h = Harness(
+            num_blocks=8,
+            speculative_reserve_blocks=2,
+            max_bundle_chunks=1,
+            retention_lease_bundles=1,
+        )
+        demand_ctx = ReqContext(req_id="demand", kv_transfer_params=None)
+        h.manager.on_new_request(demand_ctx)
+        warm = to_keys([90, 91, 92, 93, 94, 95])
+        assert h.manager.prepare_store(warm, demand_ctx) is not None
+        h.manager.complete_store(warm, demand_ctx)
+        h.step()
+
+        prefetched = self._promote(h, 1, demand_ctx)
+        assert h.manager_counter(TieringOffloadingMetrics.PREFETCH_PROMOTED) == 1
+
+        # Ordinary persistence now needs room and must not take the promotion.
+        for batch in ([96, 97], [98, 99]):
+            keys = to_keys(batch)
+            output = h.manager.prepare_store(keys, demand_ctx)
+            if output is not None:
+                h.manager.complete_store(keys, demand_ctx)
+            h.step()
+
+        assert h.primary.lookup(prefetched[0], demand_ctx) is LookupResult.HIT, (
+            "cache persistence reclaimed the promoted block before demand"
+        )
+        assert (
+            h.manager_counter(TieringOffloadingMetrics.PREFETCH_EVICTED_BEFORE_DEMAND)
+            == 0
+        )
+
+    def test_demand_hit_releases_the_lease_and_counts_useful_once(self):
+        h = Harness(
+            num_blocks=8,
+            speculative_reserve_blocks=2,
+            max_bundle_chunks=1,
+            retention_lease_bundles=1,
+        )
+        demand_ctx = ReqContext(req_id="demand", kv_transfer_params=None)
+        h.manager.on_new_request(demand_ctx)
+        prefetched = self._promote(h, 1, demand_ctx)
+        assert len(h.primary._leased) == 1
+
+        assert h.manager.lookup(prefetched[0], demand_ctx) is LookupResult.HIT
+
+        assert not h.primary._leased, "retention ends when demand arrives"
+        assert h.manager_counter(TieringOffloadingMetrics.PREFETCH_USEFUL) == 1
+        assert h.manager_counter(TieringOffloadingMetrics.PREFETCH_WASTED) == 0
+
+    def test_eviction_before_demand_is_attributed_not_just_wasted(self):
+        # Retention off, so persistence takes the promotion as it used to.
+        h = Harness(
+            num_blocks=4,
+            speculative_reserve_blocks=1,
+            max_bundle_chunks=1,
+            retention_lease_bundles=0,
+        )
+        demand_ctx = ReqContext(req_id="demand", kv_transfer_params=None)
+        h.manager.on_new_request(demand_ctx)
+        old_demand = to_keys([90, 92, 93])
+        assert h.manager.prepare_store(old_demand, demand_ctx) is not None
+        h.manager.complete_store(old_demand, demand_ctx)
+        h.step()
+
+        self._promote(h, 1, demand_ctx)
+        assert h.manager.prepare_store(to_keys([91]), demand_ctx) is not None
+
+        # WASTED keeps its established meaning; the new counter only says why.
+        assert h.manager_counter(TieringOffloadingMetrics.PREFETCH_WASTED) == 1
+        assert (
+            h.manager_counter(TieringOffloadingMetrics.PREFETCH_EVICTED_BEFORE_DEMAND)
+            == 1
+        )
+
+    def test_reset_clears_lease_and_prefetch_tracking(self):
+        h = Harness(
+            num_blocks=8,
+            speculative_reserve_blocks=2,
+            max_bundle_chunks=1,
+            retention_lease_bundles=1,
+        )
+        demand_ctx = ReqContext(req_id="demand", kv_transfer_params=None)
+        h.manager.on_new_request(demand_ctx)
+        self._promote(h, 1, demand_ctx)
+        assert h.primary._leased
+
+        h.manager.reset_cache()
+
+        assert not h.primary._leased
+        assert not h.primary._speculative
+        assert not h.manager._prefetched
 
 
 class TestShadowMode:

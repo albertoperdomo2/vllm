@@ -48,6 +48,12 @@ class TieringOffloadingMetrics:
     PREFETCH_UNTRACKED = "vllm:kv_offload_tiering_prefetch_untracked"
     PREFETCH_LOAD_FAILED = "vllm:kv_offload_tiering_prefetch_load_failed"
     PREFETCH_LATE = "vllm:kv_offload_tiering_prefetch_late"
+    # Attribution for PREFETCH_WASTED, not a new outcome class: the subset
+    # that cache persistence reclaimed. This is the signal that validates or
+    # falsifies the retention lease.
+    PREFETCH_EVICTED_BEFORE_DEMAND = (
+        "vllm:kv_offload_tiering_prefetch_evicted_before_demand"
+    )
 
 
 @dataclass

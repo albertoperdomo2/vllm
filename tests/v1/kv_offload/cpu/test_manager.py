@@ -1351,6 +1351,145 @@ def test_capacity_gauges_distinguish_fill_from_pinned_occupancy():
     assert gauges[CPUOffloadingMetrics.CPU_CACHE_EVICTABLE_BLOCKS][()] == 4
 
 
+def _promote_and_lease(manager, key_ids, ctx=_EMPTY_REQ_CTX):
+    """Land a ready speculative bundle and retain it, as a promotion does."""
+    keys = to_keys(key_ids)
+    output = manager.prepare_store(keys, ctx, mode=AllocationMode.SPECULATIVE_ONLY)
+    assert output is not None
+    manager.complete_store(output.keys_to_store, ctx)
+    manager.mark_speculative(keys)
+    manager.lease_speculative(keys)
+    return keys
+
+
+def test_lease_retains_promoted_blocks_against_cache_persistence():
+    """The retention regression: a promoted copy must survive to demand.
+
+    Speculative blocks are the *preferred* eviction victim, so without a
+    lease ordinary GPU->CPU persistence takes a freshly promoted block before
+    the queued request arrives -- the mechanism behind 96.5% wasted
+    promotions in the live run.
+    """
+    for lease_budget, expected_survivors in ((0, 0), (2, 2)):
+        manager = make_cpu_manager(num_blocks=8, speculative_reserve_blocks=2)
+        manager.set_lease_budget(lease_budget)
+        key_id, _ = _fill_with_demand(manager, 0, batches=4, batch_size=2)
+        promoted = _promote_and_lease(manager, [9000, 9001])
+
+        _fill_with_demand(manager, key_id, batches=4, batch_size=2)
+
+        survivors = sum(
+            manager.lookup(key, _EMPTY_REQ_CTX) is LookupResult.HIT for key in promoted
+        )
+        assert survivors == expected_survivors, (
+            f"lease_budget={lease_budget}: {survivors} of 2 promoted blocks "
+            "survived ordinary persistence"
+        )
+
+
+def test_critical_demand_may_break_a_lease_and_records_it():
+    """Retention never outranks a request that is running now."""
+    manager = make_cpu_manager(num_blocks=8, speculative_reserve_blocks=2)
+    manager.set_lease_budget(2)
+    key_id, _ = _fill_with_demand(manager, 0, batches=4, batch_size=2)
+    promoted = _promote_and_lease(manager, [9000, 9001])
+
+    _fill_with_demand(
+        manager, key_id, batches=4, batch_size=2, mode=AllocationMode.DEMAND_CRITICAL
+    )
+
+    assert all(
+        manager.lookup(key, _EMPTY_REQ_CTX) is LookupResult.MISS for key in promoted
+    ), "critical demand must be able to reclaim a lease"
+    counters = manager.get_stats()._values
+    assert (
+        counters[CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_LEASE_RECLAIMED_BLOCKS][()]
+        == 2
+    ), "breaking a lease is demand pressure and must be reported as such"
+
+
+def test_unleased_speculative_is_spent_before_a_leased_block():
+    manager = make_cpu_manager(num_blocks=8, speculative_reserve_blocks=4)
+    manager.set_lease_budget(1)
+    key_id, _ = _fill_with_demand(manager, 0, batches=2, batch_size=2)
+
+    leased = _promote_and_lease(manager, [9000])
+    # A second promotion that is never leased: the budget of 1 is already used.
+    unleased = to_keys([9001])
+    output = manager.prepare_store(
+        unleased, _EMPTY_REQ_CTX, mode=AllocationMode.SPECULATIVE_ONLY
+    )
+    manager.complete_store(output.keys_to_store, _EMPTY_REQ_CTX)
+    manager.mark_speculative(unleased)
+    assert list(manager._leased) == leased
+
+    _fill_with_demand(manager, key_id, batches=3, batch_size=2)
+
+    assert manager.lookup(leased[0], _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(unleased[0], _EMPTY_REQ_CTX) is LookupResult.MISS
+
+
+def test_lease_budget_releases_the_oldest_bundle_first():
+    manager = make_cpu_manager(num_blocks=16, speculative_reserve_blocks=4)
+    manager.set_lease_budget(2)
+    first = _promote_and_lease(manager, [9000, 9001])
+    assert list(manager._leased) == first
+
+    second = _promote_and_lease(manager, [9002, 9003])
+    assert list(manager._leased) == second, (
+        "a newer bundle must displace the older lease, not accumulate"
+    )
+
+
+def test_demand_releases_the_lease():
+    manager = make_cpu_manager(num_blocks=8, speculative_reserve_blocks=2)
+    manager.set_lease_budget(2)
+    promoted = _promote_and_lease(manager, [9000, 9001])
+
+    manager.touch(promoted, _EMPTY_REQ_CTX)
+
+    assert not manager._leased, "retention is done once demand has arrived"
+    assert not manager._speculative, "a demanded block is ordinary data"
+
+
+def test_lease_budget_is_clamped_to_the_reserve():
+    manager = make_cpu_manager(num_blocks=64, speculative_reserve_blocks=4)
+    assert manager.set_lease_budget(100) == 4, (
+        "a lease wider than the reserve could never be honoured"
+    )
+
+
+def test_reset_clears_lease_state():
+    manager = make_cpu_manager(num_blocks=8, speculative_reserve_blocks=2)
+    manager.set_lease_budget(2)
+    _promote_and_lease(manager, [9000, 9001])
+
+    manager.reset_cache()
+
+    assert not manager._leased
+    assert not manager._speculative
+
+
+def test_lease_gauge_tracks_retained_blocks():
+    manager = make_cpu_manager(num_blocks=8, speculative_reserve_blocks=2)
+    manager.set_lease_budget(2)
+    assert (
+        manager.get_stats()._values[
+            CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_LEASED_BLOCKS
+        ][()]
+        == 0
+    )
+
+    _promote_and_lease(manager, [9000, 9001])
+
+    assert (
+        manager.get_stats()._values[
+            CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_LEASED_BLOCKS
+        ][()]
+        == 2
+    )
+
+
 def test_speculative_reserve_gauges_track_ownership():
     manager = make_cpu_manager(num_blocks=4, speculative_reserve_blocks=2)
     gauges = manager.get_stats()._values

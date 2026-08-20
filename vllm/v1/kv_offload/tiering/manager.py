@@ -275,6 +275,16 @@ class TieringOffloadingManager(OffloadingManager):
                     prefetch_config = replace(
                         prefetch_config, max_bundle_chunks=effective_reserve
                     )
+                # Retention lease, sized in bundles. Deliberately conservative
+                # at one bundle: it proves a promoted copy can survive to
+                # demand before any wider retention is justified. None
+                # auto-sizes to a single bundle; 0 disables retention.
+                lease_bundles = prefetch_config.retention_lease_bundles
+                if lease_bundles is None:
+                    lease_bundles = 1
+                self.primary_tier.set_lease_budget(
+                    lease_bundles * prefetch_config.max_bundle_chunks
+                )
             self._prefetch_policy = policy_cls(prefetch_config, self)
 
         # Proactively promoted keys awaiting a demand lookup, oldest
@@ -399,6 +409,12 @@ class TieringOffloadingManager(OffloadingManager):
                                 if key not in self._demanded_prefetches
                             )
                             self.primary_tier.mark_speculative(speculative_keys)
+                            # Retain the freshly promoted copy so ordinary
+                            # cache persistence cannot take it before the
+                            # queued request arrives. Keys demand already
+                            # claimed in flight are excluded above: they are
+                            # ordinary data and need no retention.
+                            self.primary_tier.lease_speculative(speculative_keys)
 
                         for key in prefetch_keys:
                             self._inflight_prefetches.pop(key, None)
@@ -633,7 +649,11 @@ class TieringOffloadingManager(OffloadingManager):
                 )
 
     def _observe_prefetch_outcome(
-        self, key: OffloadKey, primary_hit: LookupResult
+        self,
+        key: OffloadKey,
+        primary_hit: LookupResult,
+        *,
+        evicted_before_demand: bool = False,
     ) -> None:
         """Resolve a tracked prefetch against a demand lookup's primary verdict.
 
@@ -661,6 +681,13 @@ class TieringOffloadingManager(OffloadingManager):
                 TieringOffloadingMetrics.PREFETCH_WASTED,
                 labelvalues=self._tier_label(tier_idx),
             )
+            if evicted_before_demand:
+                # Additive attribution only: WASTED above is unchanged, so
+                # its meaning and any existing accounting still hold.
+                self._stats.increase_counter(
+                    TieringOffloadingMetrics.PREFETCH_EVICTED_BEFORE_DEMAND,
+                    labelvalues=self._tier_label(tier_idx),
+                )
         elif (
             primary_hit is LookupResult.HIT_PENDING and key not in self._late_prefetches
         ):
@@ -983,7 +1010,13 @@ class TieringOffloadingManager(OffloadingManager):
             return None
 
         for evicted_key in primary_result.evicted_keys:
-            self._observe_prefetch_outcome(evicted_key, LookupResult.MISS)
+            # These evictions are by definition cache persistence taking the
+            # block before demand arrived -- the failure the retention lease
+            # exists to prevent, so attribute it rather than lump it into
+            # generic waste.
+            self._observe_prefetch_outcome(
+                evicted_key, LookupResult.MISS, evicted_before_demand=True
+            )
 
         if primary_result.keys_to_store:
             state = self._req_state[req_context.req_id]

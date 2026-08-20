@@ -104,6 +104,15 @@ class CPUOffloadingManager(OffloadingManager):
         # that ends speculative ownership pops from here, so this single
         # ledger cannot drift from reality.
         self._speculative: OrderedDict[OffloadKey, None] = OrderedDict()
+        # Ready speculative blocks held against ordinary cache persistence for
+        # a bounded window, so demand gets a chance to consume them. Without
+        # it a promoted copy is the *preferred* eviction victim and is gone
+        # before the queued request arrives -- 96.5% of promotions were
+        # wasted that way. A strict subset of _speculative, insertion-ordered
+        # so the oldest lease is released first when the budget is exceeded.
+        self._leased: OrderedDict[OffloadKey, None] = OrderedDict()
+        # Blocks the lease may cover. Zero disables retention entirely.
+        self._lease_budget: int = 0
         # Blocks held back from demand so speculative work always has headroom.
         # Without it a warm cache leaves zero free blocks and every speculative
         # allocation is refused forever -- the zero-submission bug.
@@ -118,6 +127,9 @@ class CPUOffloadingManager(OffloadingManager):
         # the whole prefetch budget; the free/reserve-free gauges show the
         # resulting shortfall but not who caused it.
         self.reserve_blocks_borrowed_in_current_batch: int = 0
+        # Leased blocks broken by DEMAND_CRITICAL pressure. Distinct from a
+        # prefetch outcome: retention was overridden, not mispredicted.
+        self.lease_blocks_reclaimed_in_current_batch: int = 0
 
         # Number of block references. It is ordered so can evict the LRU entry in O(1).
         self.counts: OrderedDict[OffloadKey, int] | None = (
@@ -275,13 +287,76 @@ class CPUOffloadingManager(OffloadingManager):
         """Remove demand-touched blocks from speculative provenance.
 
         A demanded block stops counting against the reserve: it has proven
-        itself useful, so it becomes ordinary demand-owned data.
+        itself useful, so it becomes ordinary demand-owned data. The lease is
+        released first -- retention has served its purpose the moment demand
+        arrives, and holding it longer would sequester capacity for nothing.
         """
         for key in keys:
+            self._leased.pop(key, None)
             self._speculative.pop(key, None)
 
+    # --- speculative retention lease ---
+
+    def set_lease_budget(self, num_blocks: int) -> int:
+        """Blocks the retention lease may cover; 0 disables retention.
+
+        Bounded by the speculative reserve: a lease wider than the reserve
+        could never be honoured, since the reserve is what caps speculative
+        occupancy in the first place.
+
+        Returns:
+            The budget actually applied.
+        """
+        requested = max(0, num_blocks)
+        if requested > self._speculative_reserve:
+            logger.warning(
+                "Speculative lease budget of %d blocks exceeds the %d-block "
+                "speculative reserve; clamping to the reserve.",
+                requested,
+                self._speculative_reserve,
+            )
+        self._lease_budget = min(requested, self._speculative_reserve)
+        self._enforce_lease_budget()
+        return self._lease_budget
+
+    def lease_speculative(self, keys: Collection[OffloadKey]) -> None:
+        """Retain ready speculative blocks against ordinary persistence.
+
+        Only ready blocks that are still speculative are eligible: a block
+        demand already claimed while the promotion was in flight is ordinary
+        data and must not be re-marked.
+        """
+        if self._lease_budget <= 0:
+            return
+        for key in keys:
+            if key not in self._speculative:
+                continue
+            block = self._policy.get(key)
+            if block is not None and block.is_ready:
+                self._leased[key] = None
+        self._enforce_lease_budget()
+
+    def release_speculative(self, keys: Collection[OffloadKey]) -> None:
+        """Drop the lease, leaving the blocks ordinary speculative capacity."""
+        for key in keys:
+            self._leased.pop(key, None)
+
+    def _enforce_lease_budget(self) -> None:
+        """Release the oldest leases beyond the budget.
+
+        Replacement is the expiry mechanism: a newer bundle displaces an older
+        one rather than the lease growing without bound. Released blocks stay
+        speculative, so they remain reclaimable -- just no longer protected.
+        """
+        while len(self._leased) > self._lease_budget:
+            self._leased.popitem(last=False)
+
     def _evict_for_demand(
-        self, count: int, protected: set[OffloadKey]
+        self,
+        count: int,
+        protected: set[OffloadKey],
+        *,
+        respect_lease: bool = True,
     ) -> tuple[
         list[tuple[OffloadKey, BlockStatus]],
         list[tuple[OffloadKey, BlockStatus]] | None,
@@ -289,6 +364,13 @@ class CPUOffloadingManager(OffloadingManager):
         """Select `count` victims for a demand allocation.
 
         Speculative blocks are reclaimed first so demand data survives longer.
+
+        Args:
+            respect_lease: skip leased speculative blocks. True for ordinary
+                cache persistence, which must not destroy a promoted copy
+                before demand can evaluate it. DEMAND_CRITICAL passes False:
+                a request that is running now outranks retention.
+
         Returns (reclaimed_speculative, normal_victims); a None second element
         means the request cannot be satisfied and nothing has been mutated.
         """
@@ -297,7 +379,9 @@ class CPUOffloadingManager(OffloadingManager):
             return [], None
         # There is a still a chance for eviction failure as some of the
         # idle blocks might be in the protected list.
-        reclaimed = self._speculative_eviction_candidates(count, protected)
+        reclaimed = self._speculative_eviction_candidates(
+            count, protected, respect_lease=respect_lease
+        )
         # Select normal victims atomically before removing speculative blocks.
         # Protect all speculative provenance so the cache policy cannot choose
         # a demand block in their place.
@@ -309,11 +393,25 @@ class CPUOffloadingManager(OffloadingManager):
         return reclaimed, normal
 
     def _speculative_eviction_candidates(
-        self, n: int, protected: set[OffloadKey]
+        self,
+        n: int,
+        protected: set[OffloadKey],
+        *,
+        respect_lease: bool = True,
     ) -> list[tuple[OffloadKey, BlockStatus]]:
         candidates: list[tuple[OffloadKey, BlockStatus]] = []
+        if n <= 0:
+            # The budget check below runs *after* appending, so without this
+            # guard n=0 returns every eligible block instead of none. The
+            # speculative path asks for 0 whenever it has room, which made
+            # each promotion evict all previously promoted blocks.
+            return candidates
         for key in self._speculative:
             if key in protected:
+                continue
+            if respect_lease and key in self._leased:
+                # Unleased speculative blocks are spent first; a leased copy
+                # is only a victim once its lease lapses.
                 continue
             block = self._policy.get(key)
             if block is not None and block.ref_cnt == 0:
@@ -386,7 +484,12 @@ class CPUOffloadingManager(OffloadingManager):
                 len(self._speculative) + len(keys_to_store) - self._speculative_reserve,
                 len(keys_to_store) - self._get_num_free_blocks(),
             )
-            reclaimed = self._speculative_eviction_candidates(needed, protected)
+            # Speculative work displaces its own oldest, lease or not: the
+            # lease protects a promoted copy from *demand persistence*, not
+            # from the newer promotion that replaces it.
+            reclaimed = self._speculative_eviction_candidates(
+                needed, protected, respect_lease=False
+            )
             if len(reclaimed) < needed:
                 return None
             evicted = reclaimed
@@ -401,7 +504,9 @@ class CPUOffloadingManager(OffloadingManager):
                 return None
             else:
                 reclaimed, normal_evicted = self._evict_for_demand(
-                    num_blocks_to_evict, protected
+                    num_blocks_to_evict,
+                    protected,
+                    respect_lease=mode is AllocationMode.DEMAND_CACHE,
                 )
                 if normal_evicted is None:
                     if mode is AllocationMode.DEMAND_CACHE:
@@ -420,7 +525,12 @@ class CPUOffloadingManager(OffloadingManager):
                     reserve_unused = self._reserve_unused()
                     shortfall = len(keys_to_store) - free_before
                     reclaimed, normal_evicted = (
-                        self._evict_for_demand(shortfall, protected)
+                        # Only DEMAND_CRITICAL reaches here, and it has
+                        # already been refused once -- the lease must not
+                        # stand between a running request and progress.
+                        self._evict_for_demand(
+                            shortfall, protected, respect_lease=False
+                        )
                         if shortfall > 0
                         else ([], [])
                     )
@@ -446,6 +556,16 @@ class CPUOffloadingManager(OffloadingManager):
             for key, _ in reclaimed:
                 self._policy.remove(key)
                 self._speculative.pop(key, None)
+                # Membership, not the popped value: _leased maps to None, so
+                # pop() returns None for a key that was present.
+                if key in self._leased:
+                    del self._leased[key]
+                    if not speculative:
+                        # Only DEMAND_CRITICAL reaches a leased block, since
+                        # DEMAND_CACHE skips them. Counted separately because
+                        # it is demand pressure breaking retention, not
+                        # prefetch failing on its own terms.
+                        self.lease_blocks_reclaimed_in_current_batch += 1
 
             # cache-policy removes only idle blocks.
             self._num_evictable_cache_blocks -= len(evicted)
@@ -514,6 +634,7 @@ class CPUOffloadingManager(OffloadingManager):
                     self._num_write_pending_blocks -= 1
                     self._policy.remove(key)
                     self._speculative.pop(key, None)
+                    self._leased.pop(key, None)
                     self._free_block(block)
 
         if stored_keys and self.events is not None:
@@ -536,6 +657,7 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_evictable_cache_blocks = 0
         self._num_write_pending_blocks = 0
         self._speculative.clear()
+        self._leased.clear()
 
         self._free_list.clear()
         self._num_allocated_blocks = 0
@@ -602,6 +724,16 @@ class CPUOffloadingManager(OffloadingManager):
             CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_RESERVE_FREE_BLOCKS,
             self._reserve_unused(),
         )
+        stats.set_gauge(
+            CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_LEASED_BLOCKS,
+            len(self._leased),
+        )
+        if self.lease_blocks_reclaimed_in_current_batch:
+            stats.increase_counter(
+                CPUOffloadingMetrics.CPU_CACHE_SPECULATIVE_LEASE_RECLAIMED_BLOCKS,
+                counter_increase_value=self.lease_blocks_reclaimed_in_current_batch,
+            )
+            self.lease_blocks_reclaimed_in_current_batch = 0
         if self.reserve_blocks_borrowed_in_current_batch:
             stats.increase_counter(
                 CPUOffloadingMetrics.CPU_CACHE_RESERVE_BORROWED_BLOCKS,

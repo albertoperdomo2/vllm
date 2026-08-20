@@ -32,6 +32,15 @@ class CPUOffloadingMetrics:
     CPU_CACHE_RESERVE_BORROWED_BLOCKS = (
         "vllm:kv_offload_cpu_cache_reserve_borrowed_blocks"
     )
+    # Retention lease: ready speculative blocks currently held against
+    # ordinary cache persistence, and blocks whose lease demand-critical
+    # pressure had to break.
+    CPU_CACHE_SPECULATIVE_LEASED_BLOCKS = (
+        "vllm:kv_offload_cpu_cache_speculative_leased_blocks"
+    )
+    CPU_CACHE_SPECULATIVE_LEASE_RECLAIMED_BLOCKS = (
+        "vllm:kv_offload_cpu_cache_speculative_lease_reclaimed_blocks"
+    )
 
 
 class CPULoadStoreSpec(BlockIDsLoadStoreSpec):
